@@ -281,6 +281,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  HAL_Delay(500);
+	  send_pack(0xCC, 0x01, 0,NULL);
+	  HAL_Delay(500);
+	  send_pack(0xCC, 0x02, 0,NULL);
 
   }
   /* USER CODE END 3 */
