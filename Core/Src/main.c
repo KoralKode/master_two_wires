@@ -32,13 +32,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TIMESLOT 70
-#define DWT_CYCCNT   (*((volatile uint32_t*)0xE0001004))
-#define DWT_CTRL     (*((volatile uint32_t*)0xE0001000))
-#define DATA_BITS  8    // количество бит полезных данных
-#define CRC_BITS   5    // количество бит контрольной суммы
-// Полином: x⁵ + x² + 1 (0x05 без старшего бита)
-#define CRC5_POLY  0x05
+#define TIMESLOT_US     70
+#define CRC5_POLY       0x05
+#define ROM_SKIP_CMD    0xCC
+#define FUNC_OFF        0x01
+#define FUNC_ON         0x02
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -47,6 +45,7 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 
@@ -55,188 +54,267 @@
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// ========== НАСТРОЙКА ТАЙМЕРА (TIM2) ==========
+// Предполагается, что таймер TIM2 уже настроен в CubeMX:
+//   Prescaler = SystemCoreClock / 1_000_000 - 1   (тик 1 мкс)
+//   Period = TIMESLOT_US - 1                      (70-1 = 69)
+//   AutoReload Preload = Enable
+//   NVIC: TIM2 global interrupt enabled
 
-//функция инициализации для задержки в мкс
-void DWT_Init(void) {
-    DWT_CTRL |= (1 << 0);   // CYCCNTENA
-    DWT_CYCCNT = 0;
+// ========== Глобальные переменные для автомата ==========
+typedef enum {
+    IDLE,                      // нет активной операции
+    // состояния для одного сегмента (отправка + приём трёх битов)
+    SEG_START_BIT,             // отправка стартового бита (0)
+    SEG_DATA_BITS,             // отправка 8 бит данных
+    SEG_CRC_BITS,              // отправка 5 бит CRC
+    SEG_RECV_ALARM,            // приём бита аварии (первый из трёх)
+    SEG_RECV_INTR,             // приём бита прерывания (второй)
+    SEG_RECV_CRC,              // приём бита подтверждения CRC (третий)
+    SEG_COMPLETE,              // сегмент завершён, обработка результата
+    // состояния для высокоуровневой последовательности (пакет)
+    SEQ_ROM,                   // отправка ROM-команды
+    SEQ_POWER_AFTER_ROM,       // фаза питания после ROM-команды
+    SEQ_SIZE,                  // отправка сегмента с размером данных
+    SEQ_POWER_AFTER_SIZE,      // фаза питания после размера
+    SEQ_FUNC,                  // отправка функциональной команды
+    SEQ_POWER_AFTER_FUNC,      // фаза питания после функциональной команды
+    SEQ_DATA,                  // отправка байтов данных (один или несколько)
+    SEQ_END                    // пакет завершён
+} state_t;
+
+static void next_step(void);   // прототип функции для отправки пакета
+static state_t current_seq_state = IDLE;     // сохранённый этап последовательности (SEQ_*)
+static state_t global_state = IDLE;   // текущее состояние автомата
+static uint8_t tx_data = 0;           // данные для отправки в текущем сегменте
+static uint8_t tx_crc = 0;            // CRC для текущего сегмента
+static uint8_t tx_bit_index = 0;      // индекс текущего бита при отправке (0..7 или 0..4)
+static uint8_t rx_flags = 0;          // биты: 0=alarm, 1=interrupt, 2=crc_bit
+
+// Параметры пакета (из вызова send_pack)
+static uint8_t current_rom_cmd = 0;        // ROM-команда текущего пакета
+static uint8_t current_func_cmd = 0;       // функциональная команда текущего пакета
+static uint8_t current_datasize = 0;       // количество байт данных в пакете
+static uint8_t *current_data = NULL;       // указатель на массив данных
+static uint8_t data_index = 0;             // индекс текущего байта данных при отправке
+
+// Флаги для циклов подтверждения (как do-while)
+static uint8_t retry_needed = 0;           // =1 если сегмент нужно повторить (ошибка CRC)
+
+// ========== Работа с линией PB0 ==========
+// Макросы для быстрого управления выводом PB0 (открытый сток)
+#define DATA_HIGH()  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET)   // отпустить линию (1)
+#define DATA_LOW()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET) // притянуть к земле (0)
+#define DATA_READ()  HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0)                   // прочитать состояние линии
+
+// ========== Управление таймером ==========
+void start_timer(void) {
+    __HAL_TIM_SET_COUNTER(&htim2, 0);   // обнуляем счётчик таймера
+    HAL_TIM_Base_Start_IT(&htim2);      // запускаем таймер с прерываниями
 }
 
-//функция задержки в мкс
-void delay_us(uint32_t us) {
-    uint32_t start = DWT_CYCCNT;
-    uint32_t ticks = us * (SystemCoreClock / 1000000);
-    while ((DWT_CYCCNT - start) < ticks);
+void stop_timer(void) {
+    HAL_TIM_Base_Stop_IT(&htim2);       // останавливаем таймер
 }
 
-//функция отправки одного бита
-void send_bit(uint8_t bit){
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, bit);
-	delay_us(TIMESLOT);//задержка для правильного таймслота
-}
-
-//функция приёма одного бита
-uint8_t read_bit(){
-    // Отпускаем линию (записываем 1) – важно!
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 1);
-    delay_us(TIMESLOT/10);               // ждём, пока ведомый выставит уровень
-    uint8_t read_data = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0);
-    delay_us(TIMESLOT - TIMESLOT/10);    // дожидаемся конца слота
-    return read_data;
-}
-
-//функция для отправки старт бита здесь 0 не весь таймслот, в его конце линия должна подтянуться к 1
-void send_start_bit(){
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 0);
-    delay_us(TIMESLOT - (TIMESLOT/20));   // почти весь слот
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 1);   // отпускаем линию
-    delay_us(TIMESLOT/20);                // дожидаемся конца слота
-}
-
-
-
-/**
- * @brief Вычисляет CRC-5 для одного байта (MSB first)
- * @param data 8-битное значение
- * @return 5-битная контрольная сумма (0..31)
- */
+// ========== CRC-5 (MSB first) ==========
 uint8_t crc5(uint8_t data) {
-    uint8_t crc = 0x00;
-    for (int i = 7; i >= 0; i--) {
-        uint8_t bit = (data >> i) & 1;      // берём бит от старшего к младшему
-        uint8_t msb = (crc >> 4) & 1;       // старший бит текущего CRC
-        crc = ((crc << 1) | bit) & 0x1F;    // сдвигаем и добавляем новый бит
-        if (msb) crc ^= CRC5_POLY;          // если был выдвинут 1 – XOR с полиномом
+    uint8_t crc = 0x00;                 // начальное значение регистра CRC
+    for (int i = 7; i >= 0; i--) {      // проходим по битам от старшего к младшему
+        uint8_t bit = (data >> i) & 1;  // извлекаем текущий бит данных
+        uint8_t msb = (crc >> 4) & 1;   // старший бит текущего CRC (бит 4)
+        crc = ((crc << 1) | bit) & 0x1F; // сдвигаем влево и добавляем бит данных, отсекаем лишнее
+        if (msb) crc ^= CRC5_POLY;       // если выдвинулась 1, выполняем XOR с полиномом
     }
-    return crc;
+    return crc;                         // возвращаем 5-битный CRC
 }
 
-//функция отправки сегмента данных без проверочных битов
-void send_segment(uint8_t data, uint8_t crc) {
-    // 1. Старт-бит (всегда 0) – мастер притягивает линию на весь слот
-	send_start_bit();
-
-    // 2. 8 бит данных (MSB first)
-    for (int i = 7; i >= 0; i--) {
-        send_bit((data >> i) & 1);
-    }
-
-    // 3. 5 бит CRC (MSB first)
-    for (int i = 4; i >= 0; i--) {
-        send_bit((crc >> i) & 1);
-    }
-    // Отпускаем линию (записываем 1) – важно!
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, 1);
-
+// ========== Запуск одного сегмента ==========
+void start_segment(uint8_t data, uint8_t crc, state_t seq_state) {
+    current_seq_state = seq_state;   // запоминаем этап последовательности
+    tx_data = data;
+    tx_crc = crc;
+    tx_bit_index = 0;
+    rx_flags = 0;
+    global_state = SEG_START_BIT;
+    start_timer();
 }
 
-//функция имитирующая (пока) фазу питания
-void feed_phase(uint16_t feed_phase_time){
-	HAL_Delay(feed_phase_time);
+// ========== Фаза питания (блокирующая, но оставлена для простоты) ==========
+void feed_phase(uint16_t ms) {
+    HAL_Delay(ms);                      // просто задержка в миллисекундах
 }
 
-//команда пропуска адресса
-void ROM_skip(uint8_t * alarm_bit,uint8_t * interrupt_bit,uint8_t *crc_bit){
-	uint8_t crc=crc5(0xCC);
-	send_segment(0xCC, crc);
-	*alarm_bit=read_bit();
-	*interrupt_bit=read_bit();
-	*crc_bit=read_bit();
-	feed_phase(10);
-	//return alarm_bit && interrupt_bit && crc_bit;
-}
-
-
-
-//функция отключения от общения устройства
-void off(uint8_t * alarm_bit,uint8_t * interrupt_bit,uint8_t *crc_bit){
-	//сегмент функциональной команды
-	uint8_t crc=crc5(0x01);
-	send_segment(0x01, crc);
-	*alarm_bit=read_bit();
-	*interrupt_bit=read_bit();
-	*crc_bit=read_bit();
-	feed_phase(10);
-	//return alarm_bit && interrupt_bit && crc_bit;
-}
-
-//функция подключения к общению устройства
-void on(uint8_t * alarm_bit,uint8_t * interrupt_bit,uint8_t *crc_bit){
-	//сегмент функциональной команды
-	uint8_t crc=crc5(0x02);
-	send_segment(0x02, crc);
-	*alarm_bit=read_bit();
-	*interrupt_bit=read_bit();
-	*crc_bit=read_bit();
-	feed_phase(10);
-	//return alarm_bit && interrupt_bit && crc_bit;
-}
-
-// Основная функция отправки пакета
-// ROM_func: код ROM-команды (0xCC, 0x55 и т.д.)
-// func_command: код функциональной команды (0x01, 0x02 ...)
-// datasize: размер массива данных (пока не используется, но можно добавить)
-// data: массив данных (пока не используется)
-void send_pack(uint8_t ROM_func, uint8_t func_command, uint8_t datasize, uint8_t data[]){
-	// Локальные переменные для хранения битов ответа
-	uint8_t alarm_bit = 0, interrupt_bit = 0, crc_bit = 0;
-	// Отправляем ROM-команду (например, 0xCC – SKIP ROM)
-	switch (ROM_func){
-		case 0xCC:
-			do{
-				ROM_skip(&alarm_bit, &interrupt_bit, &crc_bit);
-			}while(!crc_bit);
-			break;
-		default:
-			break;
-	}
-	//далее у всех функций сначала отправляется размер данных (функциональная команда+данные) именно количество сегментов, потом фанкциональная команда, затем данные если есть
-	//отправляем размер данных
-	do{
-		send_segment(datasize+1, crc5(datasize+1));
-		alarm_bit=read_bit();
-		interrupt_bit=read_bit();
-		crc_bit=read_bit();
-		feed_phase(10);
-	}while(!crc_bit);
-
-	// После ROM-команды отправляем функциональную команду
-	switch (func_command){
-		case 0x01:
-			do{
-				off(&alarm_bit, &interrupt_bit, &crc_bit);
-			}while(!crc_bit);
-			break;
-		case 0x02:
-			do{
-				on(&alarm_bit, &interrupt_bit, &crc_bit);
-			}while(!crc_bit);
-			break;
-		default:
-			break;
-	}
-
-    // Если есть данные (datasize > 0), их нужно отправить сегментами
-    // Пока не реализовано, будет в других функциях
-    if (datasize > 0) {
-        // Например, отправить каждый байт данных отдельным сегментом
-        for (uint8_t i = 0; i < datasize; i++) {
-            do {
-                uint8_t crc = crc5(data[i]);
-                send_segment(data[i], crc);
-                alarm_bit = read_bit();
-                interrupt_bit = read_bit();
-                crc_bit = read_bit();
-                feed_phase(10);
-            } while (!crc_bit);
+// ========== Колбэк завершения сегмента ==========
+static void on_segment_done(void) {
+    if (retry_needed) {
+        // Повторяем сегмент: используем сохранённый этап
+        switch (current_seq_state) {
+            case SEQ_ROM:  start_segment(current_rom_cmd, crc5(current_rom_cmd), SEQ_ROM); break;
+            case SEQ_SIZE: start_segment(current_datasize + 1, crc5(current_datasize + 1), SEQ_SIZE); break;
+            case SEQ_FUNC: start_segment(current_func_cmd, crc5(current_func_cmd), SEQ_FUNC); break;
+            case SEQ_DATA: start_segment(current_data[data_index], crc5(current_data[data_index]), SEQ_DATA); break;
+            default: break;
+        }
+    } else {
+        // Успешно – переходим к следующему этапу последовательности
+        switch (current_seq_state) {
+            case SEQ_ROM:  global_state = SEQ_POWER_AFTER_ROM; next_step(); break;
+            case SEQ_SIZE: global_state = SEQ_POWER_AFTER_SIZE; next_step(); break;
+            case SEQ_FUNC: global_state = SEQ_POWER_AFTER_FUNC; next_step(); break;
+            case SEQ_DATA: global_state = SEQ_DATA; next_step(); break;
+            default: break;
         }
     }
+}
+
+// ========== Единственный обработчик прерывания таймера ==========
+// Вызывается каждые TIMESLOT_US микросекунд
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance != TIM2) return;   // проверяем, что прерывание от нужного таймера
+
+    switch (global_state) {
+        // --- Отправка сегмента ---
+        case SEG_START_BIT:
+            DATA_LOW();                   // выставляем 0 на весь (почти) слот
+            global_state = SEG_DATA_BITS; // переходим к отправке данных
+            break;
+
+        case SEG_DATA_BITS:
+            if (tx_bit_index < 8) {                       // пока не отправили 8 бит
+                uint8_t bit = (tx_data >> (7 - tx_bit_index)) & 1; // берём бит от старшего
+                if (bit) DATA_HIGH(); else DATA_LOW();    // выставляем бит на линию
+                tx_bit_index++;                           // следующий бит
+                if(tx_bit_index ==7){
+                    tx_bit_index = 0;                         // сброс индекса
+                    global_state = SEG_CRC_BITS;              // переходим к отправке CRC
+                }
+            }
+            break;
+
+        case SEG_CRC_BITS:
+            if (tx_bit_index < 5) {                       // пока не отправили 5 бит CRC
+                uint8_t bit = (tx_crc >> (4 - tx_bit_index)) & 1; // берём бит CRC от старшего
+                if (bit) DATA_HIGH(); else DATA_LOW();
+                tx_bit_index++;
+                if(tx_bit_index ==4){
+                    DATA_HIGH();                              // отпускаем линию после CRC
+                    global_state = SEG_RECV_ALARM;            // переходим к приёму первого ответного бита
+                }
+            }
+            break;
+
+        // --- Приём трёх битов ответа ---
+        case SEG_RECV_ALARM:
+            if (DATA_READ()) rx_flags |= 0x01;   // если линия = 1, устанавливаем бит аварии
+            global_state = SEG_RECV_INTR;        // следующий бит
+            break;
+
+        case SEG_RECV_INTR:
+            if (DATA_READ()) rx_flags |= 0x02;   // бит прерывания
+            global_state = SEG_RECV_CRC;
+            break;
+
+        case SEG_RECV_CRC:
+            if (DATA_READ()) rx_flags |= 0x04;   // бит подтверждения CRC
+            stop_timer();                                   // останавливаем таймер
+            retry_needed = ((rx_flags & 0x04) == 0) ? 1 : 0; // если crc_bit = 0, нужно повторить
+            global_state = IDLE;                            // временно в неактивное состояние
+            on_segment_done();                              // вызываем обработчик завершения
+            break;
+
+
+        default:
+            break;  // для других состояний (SEQ_*) ничего не делаем в прерывании
+    }
+}
+
+// ========== Определение next_step (перенесено выше) ==========
+static void next_step(void) {
+    uint8_t crc;
+
+    switch (global_state) {
+    case SEQ_ROM:
+         crc = crc5(current_rom_cmd);
+         start_segment(current_rom_cmd, crc, SEQ_ROM);// отправляем rom команду
+         break;
+
+        case SEQ_POWER_AFTER_ROM:
+            feed_phase(10);                              // пауза 10 мс (фаза питания)
+            global_state = SEQ_SIZE;                     // следующий этап
+            next_step();                                 // продолжаем
+            break;
+
+        case SEQ_SIZE:
+            crc = crc5(current_datasize + 1);            // CRC для байта размера (данные+функц. команда)
+            start_segment(current_datasize + 1, crc,SEQ_SIZE);    // отправляем размер
+            break;
+
+        case SEQ_POWER_AFTER_SIZE:
+            feed_phase(10);
+            global_state = SEQ_FUNC;
+            next_step();
+            break;
+
+        case SEQ_FUNC:
+            crc = crc5(current_func_cmd);                // CRC для функциональной команды
+            start_segment(current_func_cmd, crc, SEQ_FUNC);        // отправляем
+            break;
+
+        case SEQ_POWER_AFTER_FUNC:
+            feed_phase(10);
+            if (current_datasize > 0) {
+                global_state = SEQ_DATA;                 // если есть данные – переходим к их отправке
+                next_step();
+            } else {
+                global_state = SEQ_END;                  // иначе пакет завершён
+                next_step();
+            }
+            break;
+
+        case SEQ_DATA:
+            if (data_index < current_datasize) {
+                crc = crc5(current_data[data_index]);     // CRC для очередного байта данных
+                start_segment(current_data[data_index], crc,SEQ_DATA); // отправляем сегмент
+                data_index++;                             // увеличиваем индекс
+            } else {
+                global_state = SEQ_END;                   // все данные отправлены
+                next_step();
+            }
+            break;
+
+        case SEQ_END:
+            global_state = IDLE;                          // возвращаемся в бездействие
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ========== Функция send_pack_async (вызывает next_step) ==========
+void send_pack_async(uint8_t rom_cmd, uint8_t func_cmd, uint8_t datasize, uint8_t *data) {
+    current_rom_cmd = rom_cmd;          // запоминаем ROM-команду
+    current_func_cmd = func_cmd;        // запоминаем функциональную команду
+    current_datasize = datasize;        // запоминаем размер данных
+    current_data = data;                // запоминаем указатель на данные
+    data_index = 0;                     // начинаем с первого байта
+
+    global_state = SEQ_ROM;             // устанавливаем начальное состояние
+    next_step();                        // запускаем последовательность
+}
+
+// ========== Инициализация протокола ==========
+void protocol_init(void) {
+    DATA_HIGH();                        // устанавливаем линию в 1 (высокий уровень, резистор подтянет)
+    // Таймер уже настроен в CubeMX, прерывания разрешены
 }
 
 /* USER CODE END 0 */
@@ -270,8 +348,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  DWT_Init();
+
+  protocol_init();
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -281,10 +362,11 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  HAL_Delay(500);
-	  send_pack(0xCC, 0x01, 0,NULL);
-	  HAL_Delay(500);
-	  send_pack(0xCC, 0x02, 0,NULL);
+      HAL_Delay(500);
+      // Запускаем пакет асинхронно (без блокировки)
+      send_pack_async(ROM_SKIP_CMD, FUNC_OFF, 0, NULL);
+      HAL_Delay(500);
+      send_pack_async(ROM_SKIP_CMD, FUNC_ON, 0, NULL);
 
   }
   /* USER CODE END 3 */
@@ -332,6 +414,51 @@ void SystemClock_Config(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 15;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 69;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -344,11 +471,22 @@ static void MX_GPIO_Init(void)
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : PC13 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PB0 */
   GPIO_InitStruct.Pin = GPIO_PIN_0;
