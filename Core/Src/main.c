@@ -18,11 +18,13 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "usb_device.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdint.h>
 #include "protocol.h"
+#include "comport.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -100,18 +102,17 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_TIM2_Init();
+  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   //настройка прерываний от таймера
   HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
   protocol_init();//инициализация протокола
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, 1);
-  search_rom_packet_blocking();
-
-  if (found_rom_count > 0U)
-  {
-      receive_pack_async(PARAMETERS, 4U, found_roms[0]);
-  }
+  //search_rom_packet_blocking();
+  // Тип последнего запущенного пакета нужен только для вывода результата
+  static uint8_t active_packet_type = 0xFFU;
+  static uint8_t protocol_was_busy = 0U;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -121,54 +122,90 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  if (found_rom_count > 0U){
-	  //uint8_t slave_id[ROM_ID_LEN] = {0xA1, 0x10, 0x12, 0x34};
-	  int i=0;
-	  //тест skip off
 
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      // Запускаем пакет асинхронно (без блокировки)
-      send_pack_async(ROM_SKIP_CMD, FUNC_OFF, 0, NULL,NULL);
+	    // 1. Если протокол только что завершился – вывести результат
+	    if (protocol_was_busy && !protocol_is_busy())
+	    {
+	        protocol_was_busy = 0U;
 
-      //тест skip on
-      //цикл задержки между отправками пакетов
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      send_pack_async(ROM_SKIP_CMD, FUNC_ON, 0, NULL,NULL);
+	        if (active_packet_type == PACKET_TYPE_SEARCH)
+	        {
+	            comport_send_response("SEARCH done\r\n");
+	            comport_print_found_roms();
+	        }
+	        else if (active_packet_type == PACKET_TYPE_RX)
+	        {
+	            comport_send_response("RX done\r\n");
+	            comport_print_received_data();
+	        }
+	        else if (active_packet_type == PACKET_TYPE_TX)
+	        {
+	            comport_send_response("TX done\r\n");
+	        }
 
-      //тест match off
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      send_pack_async(ROM_MATCH_CMD, FUNC_OFF, 0, NULL,found_roms[0]);
+	        active_packet_type = 0xFFU;
+	    }
 
-      //тест resume off
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      send_pack_async(ROM_RESUME_CMD, FUNC_OFF, 0, NULL,NULL);
+	    // 2. Пока протокол занят, COM-порт не обрабатываем,
+	    // чтобы USB не мешал таймингу передачи.
+	    if (protocol_is_busy())
+	    {
+	        continue;
+	    }
 
-      //тест resume on
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      send_pack_async(ROM_RESUME_CMD, FUNC_ON, 0, NULL,NULL);
+	    // 3. Протокол свободен – можно читать команды из COM-порта
+	    comport_poll();
 
-      //тест skip on found_roms[0]
-	  while(i<1000000){
-		  ++i;
-	  }
-	  i=0;
-      send_pack_async(ROM_SKIP_CMD, FUNC_ON, 4U, found_roms[0],NULL);
-	  }
+	    // 4. Если из COM-порта подготовлен пакет – запускаем его
+	    if (comport_command_ready)
+	    {
+	        bool started = false;
+
+	        if (packet_type == PACKET_TYPE_TX)
+	        {
+	            uint8_t *addr_ptr = NULL;
+	            uint8_t *data_ptr = NULL;
+
+	            if (rom_cmd == ROM_MATCH_CMD)
+	            {
+	                addr_ptr = address_arr;
+	            }
+
+	            if (data_size > 0U)
+	            {
+	                data_ptr = data_arr;
+	            }
+
+	            started = send_pack_async(rom_cmd,
+	                                      func_cmd,
+	                                      data_size,
+	                                      data_ptr,
+	                                      addr_ptr);
+	        }
+	        else if (packet_type == PACKET_TYPE_RX)
+	        {
+	            started = receive_pack_async(func_cmd,
+	                                         data_size,
+	                                         address_arr);
+	        }
+	        else if (packet_type == PACKET_TYPE_SEARCH)
+	        {
+	            started = search_rom_packet_async();
+	        }
+
+	        if (started)
+	        {
+	            active_packet_type = packet_type;
+	            protocol_was_busy = 1U;
+	            comport_clear_command();
+	        }
+	        else
+	        {
+	            comport_send_response("Error: protocol did not start\r\n");
+	        }
+	    }
+
+
   }
   /* USER CODE END 3 */
 }
@@ -190,10 +227,16 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 15;
+  RCC_OscInitStruct.PLL.PLLN = 144;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
