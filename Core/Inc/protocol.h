@@ -34,6 +34,7 @@ extern TIM_HandleTypeDef htim2;
 #define ROM_MATCH_CMD       0x55U
 #define ROM_ALARM_CMD       0xECU
 #define ROM_RESUME_CMD      0x69U
+#define ROM_SEARCH_INTERRUPT_CMD 0xE1U // Поиск ведомых устройств, у которых установлен флаг прерывания
 
 // ===== Функциональные команды =====
 #define FUNC_OFF    0x01U
@@ -46,10 +47,43 @@ extern TIM_HandleTypeDef htim2;
 extern uint8_t found_roms[MAX_FOUND_DEVICES][ROM_ID_LEN];
 extern uint8_t found_rom_count;
 
+// ===== Результаты поиска устройств с флагом прерывания =====
+// Этот массив заполняется командой ROM_SEARCH_INTERRUPT_CMD.
+// Он не должен смешиваться с основным массивом found_roms.
+extern uint8_t interrupt_roms[MAX_FOUND_DEVICES][ROM_ID_LEN];
+extern uint8_t interrupt_rom_count;
+
+// ===== Результаты будущего поиска устройств с флагом аварии =====
+// Сейчас обработка alarm ещё не реализована, но массив сразу добавляется,
+// чтобы логика хранения результатов была разделена.
+extern uint8_t alarm_roms[MAX_FOUND_DEVICES][ROM_ID_LEN];
+extern uint8_t alarm_rom_count;
+
 // ===== Результаты приёма данных мастером =====
 extern uint8_t received_data[MAX_RECEIVED_DATA_SIZE];
 extern uint8_t received_data_count;
 
+// ===== События протокола для вывода пользователю =====
+#define PROTOCOL_EVENT_NONE              0U
+#define PROTOCOL_EVENT_NEW_DEVICES        1U
+#define PROTOCOL_EVENT_INTERRUPT_DEVICES  2U
+#define PROTOCOL_EVENT_ALARM_DEVICES       3U
+
+extern volatile uint8_t protocol_event_type;
+
+// Устанавливается, если текущий пользовательский пакет был прерван
+// из-за принятого бита alarm.
+extern volatile uint8_t protocol_packet_aborted_by_alarm;
+
+void protocol_poll(void);
+void protocol_clear_event(void);
+// Сброс признака аварийного завершения пользовательского пакета.
+// Вызывается из main.c после вывода сообщения пользователю.
+void protocol_clear_packet_abort_flag(void);
+bool search_interrupt_packet_async(void);
+// Запуск поиска ведомых устройств, у которых установлен флаг alarm.
+// Результаты поиска записываются в alarm_roms[].
+bool search_alarm_packet_async(void);
 // ===== Публичные функции библиотеки =====
 void protocol_init(void);
 bool protocol_is_busy(void);
@@ -66,6 +100,8 @@ bool send_pack_async(uint8_t rom_cmd,
 bool receive_pack_async(uint8_t func_cmd,
                         uint8_t receive_size,
                         uint8_t *slave_id);
+
+bool receive_pack_skip_async(uint8_t func_cmd, uint8_t receive_size);
 
 void clear_received_data(void);
 

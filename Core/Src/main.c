@@ -128,7 +128,15 @@ int main(void)
 	    {
 	        protocol_was_busy = 0U;
 
-	        if (active_packet_type == PACKET_TYPE_SEARCH)
+	        if (protocol_packet_aborted_by_alarm)
+	        {
+	            // Пакет был остановлен из-за alarm.
+	            // Поэтому не пишем "TX done" или "RX done",
+	            // чтобы не создавать ложное впечатление успешного завершения.
+	            comport_send_response("PACKET stopped: alarm detected\r\n");
+	            protocol_clear_packet_abort_flag();
+	        }
+	        else if (active_packet_type == PACKET_TYPE_SEARCH)
 	        {
 	            comport_send_response("SEARCH done\r\n");
 	            comport_print_found_roms();
@@ -145,12 +153,70 @@ int main(void)
 
 	        active_packet_type = 0xFFU;
 	    }
-
+		  // 1.1. Фоновая обработка внутренних событий протокола.
+		  // Здесь обрабатывается бит прерывания, принятый в завершённом пакете.
+		  //
+		  // Важно: protocol_poll() ничего не делает, пока протокол занят.
+	    // Поэтому обработка прерывания начнётся только после завершения
+	    // текущего пользовательского пакета.
+	    protocol_poll();
 	    // 2. Пока протокол занят, COM-порт не обрабатываем,
 	    // чтобы USB не мешал таймингу передачи.
 	    if (protocol_is_busy())
 	    {
 	        continue;
+	    }
+
+	    // 2.1. Если внутренняя обработка прерывания или alarm завершилась,
+	    // выводим результат пользователю через COM-порт.
+	    //
+	    // Новые устройства добавляются в основной массив found_roms[].
+	    // Устройства с прерыванием хранятся в interrupt_roms[].
+	    // Устройства с alarm хранятся в alarm_roms[].
+	    if (protocol_event_type != PROTOCOL_EVENT_NONE)
+	    {
+	    	if (protocol_event_type == PROTOCOL_EVENT_NEW_DEVICES)
+	    	{
+	    	    comport_send_response("INTERRUPT: new device detected\r\n");
+	    	    comport_send_response("Updated ROM-search result:\r\n");
+	    	    comport_print_found_roms();
+	    	}
+	        else if (protocol_event_type == PROTOCOL_EVENT_INTERRUPT_DEVICES)
+	        {
+	            comport_send_response("INTERRUPT: devices with interrupt flag\r\n");
+	            comport_send_response("Interrupt devices: %u\r\n", interrupt_rom_count);
+
+	            // Печатаем адреса из отдельного массива interrupt_roms.
+	            // Основной список found_roms при этом не изменяется.
+	            for (uint8_t i = 0U; i < interrupt_rom_count; i++)
+	            {
+	                comport_send_response("INT_ROM[%u]: %02X %02X %02X %02X\r\n",
+	                                      i,
+	                                      interrupt_roms[i][0],
+	                                      interrupt_roms[i][1],
+	                                      interrupt_roms[i][2],
+	                                      interrupt_roms[i][3]);
+	            }
+	        }else if (protocol_event_type == PROTOCOL_EVENT_ALARM_DEVICES)
+	        {
+	            comport_send_response("ALARM: devices with alarm flag\r\n");
+	            comport_send_response("Alarm devices: %u\r\n", alarm_rom_count);
+
+	            // Печатаем адреса из отдельного массива alarm_roms.
+	            // Основной список found_roms при этом не изменяется.
+	            for (uint8_t i = 0U; i < alarm_rom_count; i++)
+	            {
+	                comport_send_response("ALARM_ROM[%u]: %02X %02X %02X %02X\r\n",
+	                                      i,
+	                                      alarm_roms[i][0],
+	                                      alarm_roms[i][1],
+	                                      alarm_roms[i][2],
+	                                      alarm_roms[i][3]);
+	            }
+	        }
+
+	        // После вывода события разрешаем протоколу принимать новые события.
+	        protocol_clear_event();
 	    }
 
 	    // 3. Протокол свободен – можно читать команды из COM-порта
