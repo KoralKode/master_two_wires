@@ -140,6 +140,16 @@ int main(void)
 	        {
 	            comport_send_response("SEARCH done\r\n");
 	            comport_print_found_roms();
+
+	            /*
+	             * После обычного поиска адресов запускаем получение параметров питания.
+	             *
+	             * Здесь параметры НЕ передаются на ПК.
+	             * Мастер только поочерёдно отправляет каждому найденному ведомому
+	             * пакет MATCH + PARAMETERS, принимает 10 байт ответа
+	             * и сохраняет их во внутренний массив power_params[].
+	             */
+	            (void)power_params_request_all_async();
 	        }
 	        else if (active_packet_type == PACKET_TYPE_RX)
 	        {
@@ -180,6 +190,19 @@ int main(void)
 	    	    comport_send_response("INTERRUPT: new device detected\r\n");
 	    	    comport_send_response("Updated ROM-search result:\r\n");
 	    	    comport_print_found_roms();
+
+	    	    /*
+	    	     * После обнаружения новых устройств нужно получить их параметры питания.
+	    	     *
+	    	     * Функция power_params_request_all_async() проходит по found_roms[]
+	    	     * и запрашивает PARAMETERS только у тех адресов,
+	    	     * для которых ещё нет актуальной записи в power_params[].
+	    	     *
+	    	     * Поэтому старые ведомые повторно не опрашиваются,
+	    	     * а новое ведомое, добавленное в конец found_roms[],
+	    	     * получит параметры в такой же ячейке массива power_params[].
+	    	     */
+	    	    (void)power_params_request_all_async();
 	    	}
 	        else if (protocol_event_type == PROTOCOL_EVENT_INTERRUPT_DEVICES)
 	        {
@@ -213,10 +236,37 @@ int main(void)
 	                                      alarm_roms[i][2],
 	                                      alarm_roms[i][3]);
 	            }
+	        }else if (protocol_event_type == PROTOCOL_EVENT_POWER_PARAMS_READY)
+	        {
+	            /*
+	             * Все RX-пакеты PARAMETERS завершены.
+	             * Параметры уже сохранены в power_params[],
+	             * теперь их можно вывести на ПК.
+	             */
+	            comport_print_power_params();
+	        }else if (protocol_event_type == PROTOCOL_EVENT_FEED_PLAN_SENT)
+	        {
+	            /*
+	             * Все индивидуальные пакеты FEED_PLAN отправлены ведомым.
+	             * На этом этапе план только передан ведомым,
+	             * выполнение цикла питания добавим отдельно.
+	             */
+	            comport_send_response("FEED PLAN sent to devices\r\n");
 	        }
 
 	        // После вывода события разрешаем протоколу принимать новые события.
 	        protocol_clear_event();
+	        /*
+	         * Обработка события могла запустить внутренний пакет протокола,
+	         * например MATCH + PARAMETERS после обнаружения нового ведомого.
+	         * В таком случае COM-порт в этом проходе цикла не обрабатываем,
+	         * чтобы не попытаться запустить пользовательскую команду
+	         * параллельно с внутренним обменом.
+	         */
+	        if (protocol_is_busy())
+	        {
+	            continue;
+	        }
 	    }
 
 	    // 3. Протокол свободен – можно читать команды из COM-порта

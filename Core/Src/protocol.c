@@ -1,5 +1,16 @@
 #include "protocol.h"
 #include <string.h>
+// ===== Формат передаваемых данных FEED_PLAN =====
+// Максимум фаз – 32, поэтому маска занимает максимум 4 байта.
+//
+// Данные после функциональной команды FEED_PLAN:
+//   1 байт  – количество фаз питания;
+//   4 байта – суммарная длительность фазы питания, мкс;
+//   далее   – байты индивидуальной маски.
+#define FEED_PLAN_TX_MASK_BYTES_MAX       ((FEED_PLAN_MAX_PHASES + 7U) / 8U)
+#define FEED_PLAN_TX_DURATION_BYTES       4U
+#define FEED_PLAN_TX_MASK_OFFSET          (1U + FEED_PLAN_TX_DURATION_BYTES)
+#define FEED_PLAN_TX_DATA_MAX_SIZE        (FEED_PLAN_TX_MASK_OFFSET + FEED_PLAN_TX_MASK_BYTES_MAX)
 // ========== Внутренние состояния автомата протокола ==========
 typedef enum {
     IDLE,
@@ -95,9 +106,52 @@ uint8_t interrupt_roms[MAX_FOUND_DEVICES][ROM_ID_LEN] = {0};
 uint8_t interrupt_rom_count = 0;
 
 // ===== ROM-alarm =====
-// Массив подготовлен заранее для будущей обработки бита аварии.
+// Здесь хранятся адреса ведомых устройств, которые выставили бит alarm.
+// Основной список found_roms[] при этом не изменяется.
 uint8_t alarm_roms[MAX_FOUND_DEVICES][ROM_ID_LEN] = {0};
 uint8_t alarm_rom_count = 0;
+
+// ===== Параметры питания найденных ведомых устройств =====
+// Массив power_params[] связан с found_roms[] по индексу.
+// Например, параметры устройства found_roms[3]
+// хранятся в power_params[3].
+power_params_t power_params[MAX_FOUND_DEVICES] = {0};
+
+// Количество устройств, для которых параметры уже успешно приняты.
+uint8_t power_params_count = 0U;
+// ===== План питания, полученный от ПК =====
+// В дальнейшем эти данные будут использоваться для управления источником питания
+// и для передачи индивидуальных масок ведомым устройствам.
+feed_plan_data_t feed_plan_data = {0};
+
+// ===== Состояние передачи индивидуального плана питания ведомым =====
+// 1 – сейчас мастер последовательно отправляет FEED_PLAN найденным ведомым.
+static uint8_t feed_plan_send_processing = 0U;
+
+// 1 – пакет FEED_PLAN уже запущен, ждём его завершения.
+static uint8_t feed_plan_send_waiting_packet = 0U;
+
+// Индекс ведомого устройства в found_roms[],
+// которому сейчас передаётся индивидуальная маска.
+static uint8_t feed_plan_send_index = 0U;
+
+// Буфер данных для одного пакета FEED_PLAN.
+// Он static, потому что send_pack_async() хранит указатель на данные,
+// а пакет передаётся асинхронно через прерывания таймера.
+static uint8_t feed_plan_tx_data[FEED_PLAN_TX_DATA_MAX_SIZE] = {0};
+
+// ===== Состояние внутренней процедуры запроса параметров =====
+// 1 – сейчас выполняется последовательный запрос PARAMETERS
+// у найденных ведомых устройств.
+static uint8_t power_params_processing = 0U;
+
+// 1 – пакет PARAMETERS уже отправлен, и мастер ждёт,
+// когда RX-пакет завершится и данные можно будет разобрать.
+static uint8_t power_params_waiting_response = 0U;
+
+// Индекс текущего ведомого устройства в массиве found_roms[],
+// у которого сейчас запрашиваются параметры.
+static uint8_t power_params_index = 0U;
 
 static uint8_t search_rom_no[ROM_ID_LEN] = {0};
 static uint8_t search_last_rom[ROM_ID_LEN] = {0};
@@ -202,6 +256,12 @@ static void search_store_found_device(void);
 static void start_search_segment(void);
 static void on_search_segment_done(void);
 
+static void feed_plan_send_reset_state(void);
+static uint8_t feed_plan_get_mask_byte_count(uint8_t phase_count);
+static uint8_t feed_plan_prepare_slave_data(uint8_t device_index);
+static bool feed_plan_start_next_slave(void);
+static void feed_plan_continue_sending(void);
+
 static void handle_service_flags_after_segment(void);
 static bool search_packet_async_with_cmd(uint8_t rom_cmd, uint8_t search_type, uint8_t clear_result_array);
 static void clear_search_active_flags(void);
@@ -221,6 +281,15 @@ static void append_unique_rom(uint8_t roms[MAX_FOUND_DEVICES][ROM_ID_LEN],
 static uint8_t search_get_current_result_count(void);
 static void start_interrupt_processing(void);
 static void continue_interrupt_processing(void);
+
+static uint32_t read_u32_be(const uint8_t *buf);
+
+static uint8_t power_params_count_valid(void);
+static uint8_t power_params_is_actual_for_index(uint8_t index);
+static void power_params_store_from_received(uint8_t index);
+
+static bool power_params_start_next_request(void);
+static void power_params_continue_processing(void);
 
 static void start_alarm_processing(void);
 static void continue_alarm_processing(void);
@@ -473,8 +542,15 @@ void search_rom_packet_reset(void)
     clear_rom_list(interrupt_roms, &interrupt_rom_count);
     clear_rom_list(alarm_roms, &alarm_rom_count);
 
+    // Полный сброс поиска должен также очищать параметры питания,
+    // потому что они связаны с адресами из found_roms[] по индексу.
+    power_params_reset();
+    // План питания связан со списком found_roms[].
+    // При полном сбросе поиска старый план больше не считается актуальным.
+    feed_plan_reset();
     search_result_target = SEARCH_RESULT_FOUND;
     search_engine_reset();
+
 }
 
 // ===== Подготовка поиска следующего адреса =====
@@ -569,8 +645,8 @@ static void search_store_found_device(void)
     }
     else if (search_result_target == SEARCH_RESULT_ALARM)
     {
-        // Будущий поиск устройств с флагом аварии.
-        // Сейчас alarm ещё не обрабатывается, но хранение уже разделено.
+    	// Поиск устройств с флагом аварии.
+    	// Адреса сохраняются отдельно и не попадают в основной список устройств.
         append_unique_rom(alarm_roms,
                           &alarm_rom_count,
                           search_rom_no);
@@ -665,6 +741,15 @@ static bool search_packet_async_with_cmd(uint8_t rom_cmd,
         if (clear_result_array)
         {
             clear_rom_list(found_roms, &found_rom_count);
+
+            // При полном новом поиске адресов старые параметры питания
+            // больше не считаются актуальными, потому что список found_roms[]
+            // будет сформирован заново.
+            power_params_reset();
+
+            // Старый план питания тоже больше не актуален,
+            // потому что он был связан с прежним порядком found_roms[].
+            feed_plan_reset();
         }
     }
     else if (search_type == 1U)
@@ -967,11 +1052,15 @@ static void next_step(void) {
             start_power_phase(SEQ_SIZE);
         }
         break;
-    //отправка размера+1(функциональная команда)
-    case SEQ_SIZE:
-    	// CRC для байта размера (данные+функц. команда)
-        start_segment(current_datasize + 1U, crc5(current_datasize + 1U),SEQ_SIZE);    // отправляем размер
-        break;
+        // Отправка поля размера.
+        // Поле размера содержит только количество сегментов данных,
+        // следующих после функциональной команды.
+        // Сама функциональная команда в это количество не входит.
+        case SEQ_SIZE:
+            start_segment(current_datasize,
+                          crc5(current_datasize),
+                          SEQ_SIZE);
+            break;
     //фаза питания после отправки размера
     case SEQ_POWER_AFTER_SIZE:
     	start_power_phase(SEQ_FUNC);
@@ -1281,6 +1370,573 @@ bool receive_pack_skip_async(uint8_t func_cmd, uint8_t receive_size)
     return true;
 }
 
+
+// ========== Чтение uint32_t из четырёх байтов ==========
+// Параметры времени передаются старшим байтом вперёд:
+// buf[0] – старший байт, buf[3] – младший байт.
+//
+// Такой порядок выбран по аналогии с передачей адреса:
+// сначала передаются старшие части, затем младшие.
+static uint32_t read_u32_be(const uint8_t *buf)
+{
+    return ((uint32_t)buf[0] << 24) |
+           ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] << 8)  |
+           ((uint32_t)buf[3]);
+}
+
+
+// ========== Подсчёт принятых параметров питания ==========
+// Возвращает количество ячеек power_params[],
+// в которых valid == 1.
+static uint8_t power_params_count_valid(void)
+{
+    uint8_t count = 0U;
+
+    for (uint8_t i = 0U; i < MAX_FOUND_DEVICES; i++)
+    {
+        if (power_params[i].valid)
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+
+// ========== Проверка актуальности параметров для найденного адреса ==========
+// Параметры считаются актуальными, если:
+// 1. для этой ячейки valid == 1;
+// 2. ROM-адрес внутри power_params[i] совпадает с found_roms[i].
+//
+// Это нужно для подключения новых устройств:
+// если старые адреса уже имеют параметры, повторно их не запрашиваем,
+// а параметры новых адресов будут приняты отдельно.
+static uint8_t power_params_is_actual_for_index(uint8_t index)
+{
+    if (index >= found_rom_count)
+    {
+        return 0U;
+    }
+
+    if (!power_params[index].valid)
+    {
+        return 0U;
+    }
+
+    if (memcmp(power_params[index].rom, found_roms[index], ROM_ID_LEN) != 0)
+    {
+        return 0U;
+    }
+
+    return 1U;
+}
+
+
+// ========== Сохранение принятых параметров питания ==========
+// Функция вызывается после завершения RX-пакета PARAMETERS.
+// В этот момент received_data[] уже содержит принятые байты.
+//
+// Формат received_data[]:
+//   [0]     – напряжение;
+//   [1]     – ток;
+//   [2..5]  – время заряда, uint32_t, мкс;
+//   [6..9]  – время работы, uint32_t, мкс.
+static void power_params_store_from_received(uint8_t index)
+{
+    if (index >= MAX_FOUND_DEVICES)
+    {
+        return;
+    }
+
+    // Если принято не 10 байт, параметры считаем некорректными.
+    // Такое возможно, если пакет был прерван alarm или была другая ошибка.
+    if (received_data_count != POWER_PARAMS_DATA_SIZE)
+    {
+        power_params[index].valid = 0U;
+        power_params_count = power_params_count_valid();
+        return;
+    }
+
+    // Сохраняем адрес, к которому относятся параметры.
+    memcpy(power_params[index].rom, found_roms[index], ROM_ID_LEN);
+
+    // Напряжение и ток по линии пришли как байты,
+    // но в мастере хранятся как uint32_t.
+    power_params[index].voltage = (uint32_t)received_data[0];
+    power_params[index].current = (uint32_t)received_data[1];
+
+    // Времена передаются четырьмя байтами, старший байт первым.
+    power_params[index].charge_time_us = read_u32_be(&received_data[2]);
+    power_params[index].work_time_us   = read_u32_be(&received_data[6]);
+
+    // Отмечаем, что параметры этой ячейки успешно получены.
+    power_params[index].valid = 1U;
+
+    // Обновляем счётчик успешно принятых параметров.
+    power_params_count = power_params_count_valid();
+}
+
+
+// ========== Сброс массива параметров питания ==========
+// Используется при полном новом поиске устройств.
+// После сброса все параметры считаются неизвестными.
+void power_params_reset(void)
+{
+    memset(power_params, 0, sizeof(power_params));
+    power_params_count = 0U;
+
+    power_params_processing = 0U;
+    power_params_waiting_response = 0U;
+    power_params_index = 0U;
+}
+
+// ========== Сброс внутреннего состояния передачи FEED_PLAN ==========
+static void feed_plan_send_reset_state(void)
+{
+    feed_plan_send_processing = 0U;
+    feed_plan_send_waiting_packet = 0U;
+    feed_plan_send_index = 0U;
+
+    memset(feed_plan_tx_data, 0, sizeof(feed_plan_tx_data));
+}
+
+
+// ========== Сброс плана питания ==========
+void feed_plan_reset(void)
+{
+    // Полностью очищаем сохранённый план.
+    memset(&feed_plan_data, 0, sizeof(feed_plan_data));
+
+    // Если в момент сброса шла передача плана ведомым,
+    // внутреннее состояние передачи также сбрасывается.
+    feed_plan_send_reset_state();
+}
+
+
+
+// ========== Запись плана питания в переменные микроконтроллера ==========
+// Эта функция НЕ передаёт план ведомым устройствам.
+// Она только сохраняет данные, полученные от ПК через COM-порт.
+bool feed_plan_store(uint8_t phase_count,
+                     const uint8_t *phase_voltage,
+                     const uint8_t *phase_current,
+                     uint32_t phase_duration_us,
+                     uint32_t phase_extra_duration_us,
+                     const uint32_t *device_masks,
+                     uint8_t device_count)
+{
+    // Количество фаз должно быть ненулевым и помещаться в маску uint32_t.
+    if ((phase_count == 0U) || (phase_count > FEED_PLAN_MAX_PHASES))
+    {
+        return false;
+    }
+
+    // Количество масок не может быть больше максимального числа ведомых.
+    if (device_count > MAX_FOUND_DEVICES)
+    {
+        return false;
+    }
+
+    // Активная длительность фазы должна быть ненулевой.
+    if (phase_duration_us == 0U)
+    {
+        return false;
+    }
+
+    // Проверяем, что полная длительность фазы
+    // phase_duration_us + phase_extra_duration_us
+    // помещается в uint32_t.
+    if (phase_extra_duration_us > (0xFFFFFFFFUL - phase_duration_us))
+    {
+        return false;
+    }
+
+    if ((phase_voltage == NULL) ||
+        (phase_current == NULL) ||
+        (device_masks == NULL))
+    {
+        return false;
+    }
+
+    // Перед записью нового плана очищаем старый.
+    feed_plan_reset();
+
+    feed_plan_data.phase_count = phase_count;
+
+    // Сохраняем активную длительность питания и дополнительное время отдельно.
+    // При передаче ведомому будет отправлена их сумма.
+    feed_plan_data.phase_duration_us = phase_duration_us;
+    feed_plan_data.phase_extra_duration_us = phase_extra_duration_us;
+
+    feed_plan_data.device_count = device_count;
+
+    // Сохраняем напряжения и токи фаз.
+    for (uint8_t i = 0U; i < phase_count; i++)
+    {
+        feed_plan_data.phase_voltage[i] = phase_voltage[i];
+        feed_plan_data.phase_current[i] = phase_current[i];
+    }
+
+    // Сохраняем битовые маски ведомых устройств.
+    // Порядок соответствует found_roms[].
+    for (uint8_t i = 0U; i < device_count; i++)
+    {
+        feed_plan_data.device_phase_mask[i] = device_masks[i];
+    }
+
+    feed_plan_data.valid = 1U;
+
+    return true;
+}
+
+// ========== Расчёт количества байт маски ==========
+static uint8_t feed_plan_get_mask_byte_count(uint8_t phase_count)
+{
+    // Округление phase_count / 8 вверх.
+    return (uint8_t)((phase_count + 7U) / 8U);
+}
+
+
+// ========== Подготовка данных FEED_PLAN для одного ведомого ==========
+// Формат данных FEED_PLAN:
+//   байт 0    – количество фаз питания;
+//   байты 1–4 – суммарная длительность фазы питания, мкс;
+//   далее     – байты индивидуальной маски фаз.
+//
+// В feed_plan_data.device_phase_mask[] бит 0 соответствует первой фазе,
+// бит 1 – второй фазе и так далее.
+//
+// В пакет маска укладывается иначе:
+//   первый значимый бит передаётся как старший бит первого байта.
+// Пример для N = 3 и строки "101":
+//   в памяти: биты 0 и 2;
+//   в пакете: 10100000b.
+static uint8_t feed_plan_prepare_slave_data(uint8_t device_index)
+{
+    uint8_t phase_count = feed_plan_data.phase_count;
+    uint8_t mask_bytes = feed_plan_get_mask_byte_count(phase_count);
+    uint32_t mask = feed_plan_data.device_phase_mask[device_index];
+
+    /*
+     * Ведомому передаётся не только количество фаз и маска,
+     * но и полная длительность одной фазы питания.
+     *
+     * Полная длительность складывается из:
+     *   phase_duration_us       – полезное время активного питания;
+     *   phase_extra_duration_us – добавочное время на перестройку источника питания.
+     *
+     * На стороне ведущего эти два времени хранятся отдельно,
+     * но ведомому передаётся их сумма.
+     */
+    uint32_t full_phase_duration_us =
+            feed_plan_data.phase_duration_us +
+            feed_plan_data.phase_extra_duration_us;
+
+    // Байт 0 – количество фаз питания.
+    feed_plan_tx_data[0] = phase_count;
+
+    /*
+     * Байты 1..4 – суммарная длительность фазы питания, мкс.
+     * Передаём старший байт первым.
+     */
+    feed_plan_tx_data[1] = (uint8_t)(full_phase_duration_us >> 24);
+    feed_plan_tx_data[2] = (uint8_t)(full_phase_duration_us >> 16);
+    feed_plan_tx_data[3] = (uint8_t)(full_phase_duration_us >> 8);
+    feed_plan_tx_data[4] = (uint8_t)(full_phase_duration_us);
+
+    /*
+     * Очищаем область маски перед новой упаковкой.
+     * Маска начинается не с байта 1, а с байта 5,
+     * потому что байты 1..4 заняты длительностью фазы.
+     */
+    memset(&feed_plan_tx_data[FEED_PLAN_TX_MASK_OFFSET],
+           0,
+           FEED_PLAN_TX_MASK_BYTES_MAX);
+
+    /*
+     * Упаковываем N бит маски от старшего бита к младшему.
+     * phase = 0 соответствует первой фазе питания.
+     */
+    for (uint8_t phase = 0U; phase < phase_count; phase++)
+    {
+        if (mask & ((uint32_t)1UL << phase))
+        {
+            uint8_t byte_index = (uint8_t)(phase / 8U);
+            uint8_t bit_index = (uint8_t)(phase % 8U);
+
+            /*
+             * bit_index = 0 соответствует старшему биту байта;
+             * bit_index = 7 соответствует младшему биту байта.
+             */
+            feed_plan_tx_data[FEED_PLAN_TX_MASK_OFFSET + byte_index] |=
+                    (uint8_t)(1U << (7U - bit_index));
+        }
+    }
+
+    /*
+     * Размер данных после функциональной команды FEED_PLAN:
+     *   1 байт количества фаз +
+     *   4 байта суммарной длительности +
+     *   байты маски.
+     *
+     * Сама функциональная команда FEED_PLAN в поле размера не входит.
+     */
+    return (uint8_t)(FEED_PLAN_TX_MASK_OFFSET + mask_bytes);
+}
+
+
+// ========== Запуск передачи FEED_PLAN следующему ведомому ==========
+static bool feed_plan_start_next_slave(void)
+{
+    while (feed_plan_send_index < feed_plan_data.device_count)
+    {
+        uint8_t data_size = feed_plan_prepare_slave_data(feed_plan_send_index);
+
+        /*
+         * Отправляем обычный TX-пакет:
+         * ROM_MATCH -> адрес ведомого -> размер -> FEED_PLAN -> данные.
+         *
+
+         * В send_pack_async() передаётся только размер данных,
+         * следующих после функциональной команды.
+         *
+         * Сама функциональная команда FEED_PLAN в поле размера не входит.
+
+         */
+        if (!send_pack_async(ROM_MATCH_CMD,
+                             FEED_PLAN,
+                             data_size,
+                             feed_plan_tx_data,
+                             found_roms[feed_plan_send_index]))
+        {
+            return false;
+        }
+
+        // Пакет запущен, теперь ждём его завершения.
+        feed_plan_send_waiting_packet = 1U;
+        return true;
+    }
+
+    // Все ведомые получили свои индивидуальные маски.
+    feed_plan_send_processing = 0U;
+    feed_plan_send_waiting_packet = 0U;
+
+    protocol_event_type = PROTOCOL_EVENT_FEED_PLAN_SENT;
+
+    return true;
+}
+
+
+// ========== Продолжение передачи индивидуальных FEED_PLAN ==========
+static void feed_plan_continue_sending(void)
+{
+    if (global_state != IDLE)
+    {
+        return;
+    }
+
+    if (!feed_plan_send_processing)
+    {
+        return;
+    }
+
+    if (feed_plan_send_waiting_packet)
+    {
+        // Предыдущий пакет FEED_PLAN завершён.
+        feed_plan_send_index++;
+        feed_plan_send_waiting_packet = 0U;
+
+        /*
+         * Если во время передачи плана возник alarm или interrupt,
+         * не запускаем следующий FEED_PLAN прямо сейчас.
+         * Сначала protocol_poll() обработает более приоритетное событие.
+         */
+        if (alarm_pending || interrupt_pending)
+        {
+            return;
+        }
+    }
+
+    (void)feed_plan_start_next_slave();
+}
+
+
+// ========== Запуск передачи индивидуальных масок всем ведомым ==========
+bool feed_plan_send_all_async(void)
+{
+    if (global_state != IDLE)
+    {
+        return false;
+    }
+
+    if (feed_plan_send_processing)
+    {
+        return false;
+    }
+
+    // План должен быть предварительно принят от ПК.
+    if (!feed_plan_data.valid)
+    {
+        return false;
+    }
+
+    // Количество фаз должно быть корректным.
+    if ((feed_plan_data.phase_count == 0U) ||
+        (feed_plan_data.phase_count > FEED_PLAN_MAX_PHASES))
+    {
+        return false;
+    }
+
+    // План должен соответствовать текущему списку найденных устройств.
+    if ((feed_plan_data.device_count == 0U) ||
+        (feed_plan_data.device_count != found_rom_count))
+    {
+        return false;
+    }
+
+    feed_plan_send_processing = 1U;
+    feed_plan_send_waiting_packet = 0U;
+    feed_plan_send_index = 0U;
+
+    if (!feed_plan_start_next_slave())
+    {
+        feed_plan_send_reset_state();
+        return false;
+    }
+
+    return true;
+}
+
+// ========== Запуск запроса PARAMETERS для следующего ведомого ==========
+// Функция ищет следующий адрес в found_roms[], для которого ещё нет
+// актуальных параметров питания, и запускает RX-пакет MATCH + PARAMETERS.
+//
+// Если все параметры уже есть, обработка завершается.
+static bool power_params_start_next_request(void)
+{
+    // Идём по всем найденным адресам.
+    while (power_params_index < found_rom_count)
+    {
+        // Если параметры для этого адреса уже есть,
+        // переходим к следующему адресу.
+        if (power_params_is_actual_for_index(power_params_index))
+        {
+            power_params_index++;
+            continue;
+        }
+
+        // Перед новым приёмом очищаем буфер received_data[].
+        clear_received_data();
+
+        // Запускаем приёмный пакет:
+        // ROM_MATCH -> адрес found_roms[power_params_index]
+        // -> размер -> PARAMETERS -> приём 10 байт.
+        if (!receive_pack_async(PARAMETERS,
+                                POWER_PARAMS_DATA_SIZE,
+                                found_roms[power_params_index]))
+        {
+            // Если пакет не запустился, оставляем обработку активной.
+            // Следующая попытка будет возможна позже через protocol_poll().
+            return false;
+        }
+
+        // Запомнили, что теперь ждём завершения RX-пакета.
+        power_params_waiting_response = 1U;
+        return true;
+    }
+
+    // Все найденные адреса просмотрены.
+    // Значит запрос PARAMETERS завершён.
+    power_params_processing = 0U;
+    power_params_waiting_response = 0U;
+
+    // Сообщаем main.c, что параметры питания готовы к выводу на ПК.
+    // Сами данные уже сохранены в power_params[].
+    protocol_event_type = PROTOCOL_EVENT_POWER_PARAMS_READY;
+
+    return true;
+}
+
+
+// ========== Продолжение процедуры получения параметров питания ==========
+// Эта функция вызывается из protocol_poll(), когда автомат протокола свободен.
+// Если предыдущий RX-пакет PARAMETERS завершён, она сохраняет данные
+// и запускает запрос параметров у следующего ведомого устройства.
+static void power_params_continue_processing(void)
+{
+    // Пока автомат занят, разбирать данные нельзя.
+    if (global_state != IDLE)
+    {
+        return;
+    }
+
+    // Если процедура получения параметров не запущена, делать нечего.
+    if (!power_params_processing)
+    {
+        return;
+    }
+
+    // Если мы ждали ответ от ведомого, значит RX-пакет уже завершился.
+    // Нужно разобрать received_data[] и сохранить параметры.
+    if (power_params_waiting_response)
+    {
+        power_params_store_from_received(power_params_index);
+
+        // Переходим к следующему найденному устройству.
+        power_params_index++;
+        power_params_waiting_response = 0U;
+
+        // Если во время приёма параметров был выставлен alarm или interrupt,
+        // не запускаем следующий PARAMETERS сразу.
+        // Сначала protocol_poll() обработает более важное событие.
+        if (alarm_pending || interrupt_pending)
+        {
+            return;
+        }
+    }
+
+    // Запускаем запрос параметров у следующего ведомого устройства.
+    (void)power_params_start_next_request();
+}
+
+
+// ========== Запуск получения параметров питания у всех найденных устройств ==========
+// Функция вызывается после завершения ROM-search.
+// Она не отправляет параметры на ПК, а только принимает их от ведомых
+// и сохраняет во внутренний массив power_params[].
+bool power_params_request_all_async(void)
+{
+    // Нельзя начинать процедуру, пока автомат протокола занят.
+    if (global_state != IDLE)
+    {
+        return false;
+    }
+
+    // Если процедура уже идёт, второй раз её не запускаем.
+    if (power_params_processing)
+    {
+        return false;
+    }
+
+    // Если устройств нет, запрашивать нечего.
+    if (found_rom_count == 0U)
+    {
+        return false;
+    }
+
+    // Начинаем проход по массиву found_roms[].
+    power_params_processing = 1U;
+    power_params_waiting_response = 0U;
+    power_params_index = 0U;
+
+    // Сразу запускаем запрос для первого устройства,
+    // у которого ещё нет актуальных параметров.
+    return power_params_start_next_request();
+}
+
+
 // ========== Запуск процедуры обработки прерывания ==========
 // Эта функция вызывается только тогда, когда текущий пакет уже завершён,
 // то есть global_state == IDLE.
@@ -1398,21 +2054,25 @@ static void continue_interrupt_processing(void)
     // ===== Этап 2: завершился обычный ROM-search после NEW_DEVICE =====
     if (interrupt_step == INTR_STEP_SEARCH_NEW_DEVICES)
     {
-    	// В массиве interrupt_roms[] теперь находятся адреса устройств,
-    	// которые участвовали в поиске по флагу прерывания.
+        // В массиве found_roms[] теперь находится обновлённый список устройств.
+        // Старые адреса не дублируются, новые адреса добавлены в конец массива.
         interrupt_processing = 0U;
         interrupt_step = INTR_STEP_NONE;
+
+        // После появления нового ведомого старый план питания уже не подходит:
+        // в нём нет маски для нового адреса.
+        // Новый план должен быть принят от ПК заново.
+        feed_plan_reset();
 
         // Сообщаем main.c, что надо вывести результат поиска новых устройств.
         protocol_event_type = PROTOCOL_EVENT_NEW_DEVICES;
         return;
     }
-
     // ===== Этап 3: завершился ROM-search_interrupt =====
     if (interrupt_step == INTR_STEP_SEARCH_INTERRUPT_DEVICES)
     {
-        // В массиве found_roms[] теперь находятся адреса устройств,
-        // которые участвовали в поиске по флагу прерывания.
+    	// В массиве interrupt_roms[] теперь находятся адреса устройств,
+    	// которые участвовали в поиске по флагу прерывания.
         interrupt_processing = 0U;
         interrupt_step = INTR_STEP_NONE;
 
@@ -1501,12 +2161,15 @@ static void continue_alarm_processing(void)
     alarm_step = ALARM_STEP_NONE;
 }
 
+
 // ========== Фоновая обработка внутренних событий протокола ==========
 // Эта функция вызывается из main.c в основном цикле.
 //
 // Она ничего не делает, пока автомат протокола занят.
 // Если протокол свободен, сначала обрабатывается alarm,
-// затем обычное прерывание.
+// затем сохраняются принятые параметры питания,
+// затем обрабатывается обычное прерывание,
+// затем продолжается запрос PARAMETERS у следующих ведомых.
 void protocol_poll(void)
 {
     // Пока автомат занят передачей, приёмом или поиском,
@@ -1523,7 +2186,7 @@ void protocol_poll(void)
         return;
     }
 
-    // Alarm имеет приоритет над обычным прерыванием.
+    // Alarm имеет самый высокий приоритет.
     // Если обработка alarm уже началась, продолжаем её.
     if (alarm_processing)
     {
@@ -1538,6 +2201,17 @@ void protocol_poll(void)
         return;
     }
 
+    // Если только что завершился RX-пакет PARAMETERS,
+    // сначала сохраняем received_data[] в power_params[].
+    //
+    // Это важно сделать до обработки interrupt, потому что received_data[]
+    // общий и может быть перезаписан внутренним пакетом NEW_DEVICE.
+    if (power_params_processing && power_params_waiting_response)
+    {
+        power_params_continue_processing();
+        return;
+    }
+
     // Если обработка прерывания уже начата,
     // продолжаем её после завершения очередного внутреннего пакета.
     if (interrupt_processing)
@@ -1546,13 +2220,33 @@ void protocol_poll(void)
         return;
     }
 
-    // Если во время обычного пакета был принят бит прерывания,
-    // запускаем обработку только сейчас, когда пакет уже завершён.
+    // Если во время обычного пакета или приёма PARAMETERS
+    // был принят бит прерывания, запускаем его обработку.
     if (interrupt_pending)
     {
         start_interrupt_processing();
         return;
     }
+
+
+    // Если идёт передача индивидуальных масок FEED_PLAN,
+    // продолжаем её после завершения очередного пакета.
+    if (feed_plan_send_processing)
+    {
+        feed_plan_continue_sending();
+        return;
+    }
+
+    // Если идёт процедура получения параметров питания,
+    // но сейчас не ожидается уже запущенный RX-пакет,
+    // запускаем PARAMETERS для следующего ведомого.
+    if (power_params_processing)
+    {
+        power_params_continue_processing();
+        return;
+    }
+
+
 }
 
 // ========== Сброс события после вывода пользователю ==========

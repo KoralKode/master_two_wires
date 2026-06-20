@@ -69,6 +69,49 @@ uint8_t data_arr[MAX_RECEIVED_DATA_SIZE] = {0};
 // main.c после запуска пакета должен сбросить его через comport_clear_command().
 volatile uint8_t comport_command_ready = 0;
 
+// ============================================================================
+// Приём плана питания из COM-порта
+// ============================================================================
+//
+// Формат ввода:
+//
+// PLAN
+// N
+// U1 U2 ... UN
+// I1 I2 ... IN
+// T_ACTIVE_US
+// T_EXTRA_US
+// MASK_DEVICE_0
+// MASK_DEVICE_1
+// ...
+//
+// Количество строк MASK_DEVICE_x равно found_rom_count.
+// Порядок масок соответствует порядку адресов found_roms[],
+// которые были выведены на ПК после поиска.
+
+typedef enum
+{
+    FEED_PLAN_INPUT_NONE = 0,
+    FEED_PLAN_INPUT_PHASE_COUNT,
+    FEED_PLAN_INPUT_VOLTAGES,
+    FEED_PLAN_INPUT_CURRENTS,
+    FEED_PLAN_INPUT_DURATION,
+    FEED_PLAN_INPUT_EXTRA_DURATION,
+    FEED_PLAN_INPUT_MASKS
+} feed_plan_input_step_t;
+
+static feed_plan_input_step_t feed_plan_input_step = FEED_PLAN_INPUT_NONE;
+
+static uint8_t feed_plan_input_phase_count = 0U;
+static uint8_t feed_plan_input_voltage[FEED_PLAN_MAX_PHASES] = {0};
+static uint8_t feed_plan_input_current[FEED_PLAN_MAX_PHASES] = {0};
+static uint32_t feed_plan_input_duration_us = 0U;
+// Дополнительное время на перестройку источника питания, мкс.
+// Оно вводится отдельной строкой после активной длительности фазы.
+static uint32_t feed_plan_input_extra_duration_us = 0U;
+
+static uint32_t feed_plan_input_masks[MAX_FOUND_DEVICES] = {0};
+static uint8_t feed_plan_input_mask_index = 0U;
 
 // ============================================================================
 // Прототипы внутренних функций
@@ -119,6 +162,32 @@ static bool rom_requires_address(uint8_t rom);
 
 // Вывод справки по доступным пакетам.
 static void print_help(void);
+
+// Запуск режима построчного ввода плана питания.
+static void feed_plan_input_start(void);
+
+// Сброс временного состояния ввода плана.
+static void feed_plan_input_reset(void);
+
+// Завершение ввода с ошибкой.
+static void feed_plan_input_fail(void);
+
+// Разбор одной строки плана питания.
+static void feed_plan_process_input_line(char **argv, int argc);
+
+// Разбор десятичного uint32_t.
+static bool parse_uint32_dec_token(const char *token, uint32_t *value);
+
+// Разбор строки напряжений или токов.
+static bool parse_feed_plan_values_line(char **argv,
+                                        int argc,
+                                        uint8_t expected_count,
+                                        uint8_t *dst);
+
+// Разбор битовой маски одного ведомого устройства.
+static bool parse_feed_plan_mask_line(const char *token,
+                                      uint8_t phase_count,
+                                      uint32_t *mask_out);
 
 // ============================================================================
 // Отправка ответа в COM-порт
@@ -202,7 +271,7 @@ void comport_clear_command(void)
 //   PACK TX SKIP 0 OFF
 //   PACK TX MATCH 0 A1 10 12 34 OFF
 //   PACK TX SKIP 4 ON 11 22 33 44
-//   PACK RX MATCH 4 A1 10 12 34 PARAMETERS
+//   PACK RX MATCH 10 A1 10 12 34 PARAMETERS
 //   PACK SEARCH
 //
 // Числа для байтов можно писать так:
@@ -242,6 +311,14 @@ void comport_process_line(char *line)
         return;
     }
 
+    // Если уже начат построчный ввод плана питания,
+    // все следующие строки считаются частью плана.
+    if (feed_plan_input_step != FEED_PLAN_INPUT_NONE)
+    {
+        feed_plan_process_input_line(argv, argc);
+        return;
+    }
+
     // Справка.
     if (str_eq_ci(argv[0], "HELP") || strcmp(argv[0], "?") == 0)
     {
@@ -270,6 +347,22 @@ void comport_process_line(char *line)
     if (str_eq_ci(argv[0], "RXDATA"))
     {
         comport_print_received_data();
+        return;
+    }
+
+    // Запуск построчного ввода плана питания.
+    // После этой команды пользователь вводит:
+    // N, строку напряжений, строку токов, длительность,
+    // затем по одной битовой маске на каждое найденное ведомое устройство.
+    if (str_eq_ci(argv[0], "PLAN") || str_eq_ci(argv[0], "FEEDPLAN"))
+    {
+        if (argc != 1)
+        {
+            comport_send_response("wrong data\r\n");
+            return;
+        }
+
+        feed_plan_input_start();
         return;
     }
 
@@ -573,6 +666,408 @@ void comport_print_found_roms(void)
     }
 }
 
+// ========== Вывод параметров питания найденных ведомых устройств ==========
+// Параметры берутся из массива power_params[].
+// Индекс power_params[i] соответствует адресу found_roms[i].
+//
+// Для каждого ведомого устройства выводится 5 строк:
+// 1. ROM-адрес;
+// 2. напряжение;
+// 3. ток;
+// 4. время заряда;
+// 5. время работы от внутреннего накопителя.
+void comport_print_power_params(void)
+{
+    if (found_rom_count == 0U)
+    {
+        comport_send_response("Power parameters: no devices\r\n");
+        return;
+    }
+
+    comport_send_response("Power parameters:\r\n");
+
+    for (uint8_t i = 0U; i < found_rom_count; i++)
+    {
+        // Первая строка – адрес ведомого устройства.
+        comport_send_response("DEVICE[%u] ROM: %02X %02X %02X %02X\r\n",
+                              i,
+                              found_roms[i][0],
+                              found_roms[i][1],
+                              found_roms[i][2],
+                              found_roms[i][3]);
+
+        // Если параметры для этого адреса не были успешно приняты,
+        // всё равно выводим 5 строк на устройство, но явно показываем ошибку.
+        if (!power_params[i].valid)
+        {
+            comport_send_response("  Voltage: not received\r\n");
+            comport_send_response("  Current: not received\r\n");
+            comport_send_response("  Charge time: not received\r\n");
+            comport_send_response("  Work time: not received\r\n");
+            continue;
+        }
+
+        // Внутри power_params[] напряжение и ток хранятся как uint32_t,
+        // хотя по линии они приходят одним байтом.
+        comport_send_response("  Voltage: %lu V\r\n",
+                              (unsigned long)power_params[i].voltage);
+
+        comport_send_response("  Current: %lu mA\r\n",
+                              (unsigned long)power_params[i].current);
+
+        // Время заряда и время работы хранятся в микросекундах.
+        comport_send_response("  Charge time: %lu us\r\n",
+                              (unsigned long)power_params[i].charge_time_us);
+
+        comport_send_response("  Work time: %lu us\r\n",
+                              (unsigned long)power_params[i].work_time_us);
+    }
+}
+
+// ========== Сброс временного состояния ввода плана питания ==========
+static void feed_plan_input_reset(void)
+{
+    feed_plan_input_step = FEED_PLAN_INPUT_NONE;
+
+    feed_plan_input_phase_count = 0U;
+    feed_plan_input_duration_us = 0U;
+    feed_plan_input_mask_index = 0U;
+    feed_plan_input_extra_duration_us = 0U;
+    memset(feed_plan_input_voltage, 0, sizeof(feed_plan_input_voltage));
+    memset(feed_plan_input_current, 0, sizeof(feed_plan_input_current));
+    memset(feed_plan_input_masks, 0, sizeof(feed_plan_input_masks));
+}
+
+
+// ========== Запуск построчного ввода плана питания ==========
+static void feed_plan_input_start(void)
+{
+    // Если устройств ещё нет, принимать план бессмысленно:
+    // маски должны соответствовать порядку found_roms[].
+    if (found_rom_count == 0U)
+    {
+        comport_send_response("wrong data\r\n");
+        return;
+    }
+
+    feed_plan_input_reset();
+
+    // Следующая строка должна содержать количество фаз N.
+    feed_plan_input_step = FEED_PLAN_INPUT_PHASE_COUNT;
+
+    comport_send_response("OK: enter feed plan\r\n");
+}
+
+
+// ========== Ошибка ввода плана питания ==========
+static void feed_plan_input_fail(void)
+{
+    // При любой ошибке сбрасываем временное состояние
+    // и выводим общее сообщение, без детальной диагностики.
+    feed_plan_input_reset();
+    comport_send_response("wrong data\r\n");
+}
+
+
+// ========== Разбор десятичного uint32_t ==========
+// Для плана питания числа вводятся как обычные десятичные значения.
+static bool parse_uint32_dec_token(const char *token, uint32_t *value)
+{
+    if ((token == NULL) || (value == NULL) || (*token == '\0'))
+    {
+        return false;
+    }
+
+    char *endptr = NULL;
+    unsigned long parsed = strtoul(token, &endptr, 10);
+
+    if ((endptr == token) || (*endptr != '\0'))
+    {
+        return false;
+    }
+
+    if (parsed > 0xFFFFFFFFUL)
+    {
+        return false;
+    }
+
+    *value = (uint32_t)parsed;
+    return true;
+}
+
+
+// ========== Разбор строки напряжений или токов ==========
+// В строке должно быть ровно expected_count чисел.
+// Каждое число должно помещаться в uint8_t.
+static bool parse_feed_plan_values_line(char **argv,
+                                        int argc,
+                                        uint8_t expected_count,
+                                        uint8_t *dst)
+{
+    if ((argv == NULL) || (dst == NULL))
+    {
+        return false;
+    }
+
+    if (argc != expected_count)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0U; i < expected_count; i++)
+    {
+        uint32_t value = 0U;
+
+        if (!parse_uint32_dec_token(argv[i], &value))
+        {
+            return false;
+        }
+
+        if (value > 255U)
+        {
+            return false;
+        }
+
+        dst[i] = (uint8_t)value;
+    }
+
+    return true;
+}
+
+
+// ========== Разбор битовой маски одного ведомого устройства ==========
+// Длина строки должна быть равна количеству фаз.
+// Допускаются только символы '0' и '1'.
+static bool parse_feed_plan_mask_line(const char *token,
+                                      uint8_t phase_count,
+                                      uint32_t *mask_out)
+{
+    if ((token == NULL) || (mask_out == NULL))
+    {
+        return false;
+    }
+
+    if (strlen(token) != phase_count)
+    {
+        return false;
+    }
+
+    uint32_t mask = 0U;
+
+    for (uint8_t i = 0U; i < phase_count; i++)
+    {
+        if (token[i] == '1')
+        {
+            // Бит 0 соответствует первой фазе,
+            // бит 1 – второй фазе и т.д.
+            mask |= ((uint32_t)1U << i);
+        }
+        else if (token[i] == '0')
+        {
+            // В этой фазе ведомое устройство не питается.
+        }
+        else
+        {
+            return false;
+        }
+    }
+
+    *mask_out = mask;
+    return true;
+}
+
+
+// ========== Обработка одной строки построчного ввода плана питания ==========
+static void feed_plan_process_input_line(char **argv, int argc)
+{
+    if ((argv == NULL) || (argc == 0))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_PHASE_COUNT)
+    {
+        // Строка должна содержать только N.
+        if (argc != 1)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        uint32_t phase_count = 0U;
+
+        if (!parse_uint32_dec_token(argv[0], &phase_count))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if ((phase_count == 0U) || (phase_count > FEED_PLAN_MAX_PHASES))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_phase_count = (uint8_t)phase_count;
+        feed_plan_input_step = FEED_PLAN_INPUT_VOLTAGES;
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_VOLTAGES)
+    {
+        // Строка напряжений: ровно N чисел.
+        if (!parse_feed_plan_values_line(argv,
+                                         argc,
+                                         feed_plan_input_phase_count,
+                                         feed_plan_input_voltage))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_step = FEED_PLAN_INPUT_CURRENTS;
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_CURRENTS)
+    {
+        // Строка токов: ровно N чисел.
+        if (!parse_feed_plan_values_line(argv,
+                                         argc,
+                                         feed_plan_input_phase_count,
+                                         feed_plan_input_current))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_step = FEED_PLAN_INPUT_DURATION;
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_DURATION)
+    {
+        // Строка активной длительности фазы питания: одно число, мкс.
+        // Это именно полезное время питания, без времени перестройки источника.
+        if (argc != 1)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if (!parse_uint32_dec_token(argv[0], &feed_plan_input_duration_us))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if (feed_plan_input_duration_us == 0U)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        // Следующая строка должна содержать дополнительное время
+        // на перестройку источника питания.
+        feed_plan_input_step = FEED_PLAN_INPUT_EXTRA_DURATION;
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_EXTRA_DURATION)
+    {
+        // Строка дополнительного времени: одно число, мкс.
+        // Нулевое значение допускается, если дополнительная задержка не нужна.
+        if (argc != 1)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if (!parse_uint32_dec_token(argv[0], &feed_plan_input_extra_duration_us))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        // Проверяем, что сумма активного времени и дополнительного времени
+        // помещается в uint32_t. Именно эта сумма будет передана ведомому.
+        if (feed_plan_input_extra_duration_us >
+            (0xFFFFFFFFUL - feed_plan_input_duration_us))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_mask_index = 0U;
+        feed_plan_input_step = FEED_PLAN_INPUT_MASKS;
+        return;
+    }
+
+    if (feed_plan_input_step == FEED_PLAN_INPUT_MASKS)
+    {
+        // Каждая строка маски должна быть одним токеном,
+        // например 100, 010, 101.
+        if (argc != 1)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if (feed_plan_input_mask_index >= found_rom_count)
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        if (!parse_feed_plan_mask_line(argv[0],
+                                       feed_plan_input_phase_count,
+                                       &feed_plan_input_masks[feed_plan_input_mask_index]))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_mask_index++;
+
+        // Если приняли маски для всех найденных ведомых,
+        // сохраняем готовый план в protocol.c.
+        if (feed_plan_input_mask_index >= found_rom_count)
+        {
+            if (!feed_plan_store(feed_plan_input_phase_count,
+                                 feed_plan_input_voltage,
+                                 feed_plan_input_current,
+                                 feed_plan_input_duration_us,
+                                 feed_plan_input_extra_duration_us,
+                                 feed_plan_input_masks,
+                                 found_rom_count))
+            {
+                feed_plan_input_fail();
+                return;
+            }
+
+            /*
+             * План успешно сохранён в памяти мастера.
+             * Сразу запускаем передачу индивидуальных масок ведомым устройствам.
+             */
+            if (!feed_plan_send_all_async())
+            {
+                feed_plan_reset();
+                feed_plan_input_fail();
+                return;
+            }
+
+            feed_plan_input_reset();
+            comport_send_response("FEED PLAN saved\r\n");
+            return;
+        }
+
+        return;
+    }
+
+    // Защита от неизвестного состояния.
+    feed_plan_input_fail();
+}
 
 void comport_print_received_data(void)
 {
@@ -971,6 +1466,17 @@ static void print_help(void)
     comport_send_response("  PACK TX MATCH 0 A1 10 12 34 OFF\r\n");
     comport_send_response("  PACK TX MATCH 0 A1101234 OFF\r\n");
     comport_send_response("  PACK TX SKIP 4 ON 11 22 33 44\r\n");
-    comport_send_response("  PACK RX MATCH 4 A1 10 12 34 PARAMETERS\r\n");
+    comport_send_response("  PACK RX MATCH 10 A1 10 12 34 PARAMETERS\r\n");
     comport_send_response("  PACK SEARCH\r\n");
+
+    comport_send_response("\r\nFeed plan input:\r\n");
+    comport_send_response("  PLAN\r\n");
+    comport_send_response("  N\r\n");
+    comport_send_response("  U1 U2 ... UN\r\n");
+    comport_send_response("  I1 I2 ... IN\r\n");
+    comport_send_response("  T_ACTIVE_US\r\n");
+    comport_send_response("  T_EXTRA_US\r\n");
+    comport_send_response("  MASK for ROM[0]\r\n");
+    comport_send_response("  MASK for ROM[1]\r\n");
+    comport_send_response("  ...\r\n");
 }

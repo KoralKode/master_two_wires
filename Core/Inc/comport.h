@@ -55,6 +55,10 @@ void comport_send_response(const char *fmt, ...);
 
 // Служебный вывод результатов
 void comport_print_found_roms(void);
+// Вывод параметров питания всех найденных ведомых устройств.
+// Для каждого адреса выводится 5 строк:
+// адрес, напряжение, ток, время заряда, время работы.
+void comport_print_power_params(void);
 void comport_print_received_data(void);
 
 #endif /* INC_COMPORT_H_ */
