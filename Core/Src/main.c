@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include "protocol.h"
 #include "comport.h"
+#include "ppe3323.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,6 +47,8 @@
 /* Private variables ---------------------------------------------------------*/
 TIM_HandleTypeDef htim2;
 
+UART_HandleTypeDef huart1;
+
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -54,8 +57,9 @@ TIM_HandleTypeDef htim2;
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void process_ppe_command(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -69,7 +73,81 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 	protocol_timer_irq_handler(htim);
 }
 
+// ========== Завершение неблокирующей передачи PPE-3323 ==========
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+    ppe3323_uart_tx_complete_callback(huart);
+}
 
+
+// ========== Ошибка UART PPE-3323 ==========
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    ppe3323_uart_error_callback(huart);
+}
+
+
+// ========== Обработка подготовленной команды PPE-3323 ==========
+static void process_ppe_command(void)
+{
+    bool accepted = false;
+
+    switch (ppe_command_type)
+    {
+        case PPE_COMMAND_SET:
+            accepted = ppe3323_queue_phase(ppe_command_voltage_v,
+                                           ppe_command_current_ma);
+
+            if (accepted)
+            {
+                comport_send_response(
+                    "PPE: phase setup queued: %u V, %u mA\r\n",
+                    ppe_command_voltage_v,
+                    ppe_command_current_ma);
+            }
+            break;
+
+        case PPE_COMMAND_ON:
+            accepted = ppe3323_queue_output_on();
+
+            if (accepted)
+            {
+                comport_send_response("PPE: OUT1 queued\r\n");
+            }
+            break;
+
+        case PPE_COMMAND_OFF:
+            accepted = ppe3323_queue_output_off();
+
+            if (accepted)
+            {
+                comport_send_response("PPE: OUT0 queued\r\n");
+            }
+            break;
+
+        case PPE_COMMAND_STATUS:
+        	comport_send_response("PPE driver state: %s\r\n",
+        	                      ppe3323_state_text());
+
+        	comport_send_response("PPE setup sent by UART: %u\r\n",
+        	                      ppe3323_has_phase_configuration() ? 1U : 0U);
+
+            comport_clear_ppe_command();
+            return;
+
+        case PPE_COMMAND_NONE:
+        default:
+            break;
+    }
+
+    if (!accepted)
+    {
+        comport_send_response(
+            "PPE: command rejected; source busy or not configured\r\n");
+    }
+
+    comport_clear_ppe_command();
+}
 /* USER CODE END 0 */
 
 /**
@@ -103,11 +181,24 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_USB_DEVICE_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   //настройка прерываний от таймера
   HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(TIM2_IRQn);
   protocol_init();//инициализация протокола
+
+  /*
+   * Инициализация драйвера PPE-3323.
+   *
+   * Сразу подготавливаем OUT0, чтобы после включения ведущего
+   * источник был переведён в выключенное состояние.
+   */
+  ppe3323_init(&huart1);
+
+  (void)ppe3323_queue_output_off();
+  ppe3323_poll();
+
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, 1);
   //search_rom_packet_blocking();
   // Тип последнего запущенного пакета нужен только для вывода результата
@@ -122,7 +213,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
+      /*
+       * Запуск и сопровождение неблокирующей передачи команд PPE-3323.
+       *
+       * Функция должна вызываться даже при занятом протоколе.
+       * Она не выполняет ожидание и не использует HAL_Delay().
+       */
+      ppe3323_poll();
 	    // 1. Если протокол только что завершился – вывести результат
 	    if (protocol_was_busy && !protocol_is_busy())
 	    {
@@ -271,7 +368,32 @@ int main(void)
 
 	    // 3. Протокол свободен – можно читать команды из COM-порта
 	    comport_poll();
+        /*
+         * Команда PPE-3323 не является пакетом двухпроводного протокола.
+         * Обрабатываем её отдельно.
+         */
+        if (ppe_command_ready)
+        {
+            process_ppe_command();
 
+            /*
+             * Не запускаем пакет протокола в том же проходе,
+             * где была подготовлена команда источнику.
+             */
+            continue;
+        }
+
+        /*
+         * Пока вручную отправленная команда PPE-3323 передаётся,
+         * запуск нового пакета блокируем.
+         *
+         * На следующих этапах автоматическое управление источником
+         * будет связано с фазой питания иначе.
+         */
+        if (ppe3323_is_busy())
+        {
+            continue;
+        }
 	    // 4. Если из COM-порта подготовлен пакет – запускаем его
 	    if (comport_command_ready)
 	    {
@@ -419,6 +541,39 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * @brief USART1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART1_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART1_Init 0 */
+
+  /* USER CODE END USART1_Init 0 */
+
+  /* USER CODE BEGIN USART1_Init 1 */
+
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 2400;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART1_Init 2 */
+
+  /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -442,6 +597,9 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(POWER_KEY_GPIO_Port, POWER_KEY_Pin, GPIO_PIN_RESET);
+
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -455,6 +613,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : POWER_KEY_Pin */
+  GPIO_InitStruct.Pin = POWER_KEY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(POWER_KEY_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 

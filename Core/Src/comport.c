@@ -70,6 +70,16 @@ uint8_t data_arr[MAX_RECEIVED_DATA_SIZE] = {0};
 volatile uint8_t comport_command_ready = 0;
 
 // ============================================================================
+// Команды ручного тестирования PPE-3323
+// ============================================================================
+
+volatile uint8_t ppe_command_ready = 0U;
+uint8_t ppe_command_type = PPE_COMMAND_NONE;
+
+uint8_t ppe_command_voltage_v = 0U;
+uint16_t ppe_command_current_ma = 0U;
+
+// ============================================================================
 // Приём плана питания из COM-порта
 // ============================================================================
 //
@@ -104,7 +114,13 @@ static feed_plan_input_step_t feed_plan_input_step = FEED_PLAN_INPUT_NONE;
 
 static uint8_t feed_plan_input_phase_count = 0U;
 static uint8_t feed_plan_input_voltage[FEED_PLAN_MAX_PHASES] = {0};
-static uint8_t feed_plan_input_current[FEED_PLAN_MAX_PHASES] = {0};
+/*
+ * Токи фаз в мА.
+ *
+ * uint16_t позволяет принимать значения до 3000 мА
+ * для первого регулируемого выхода PPE-3323.
+ */
+static uint16_t feed_plan_input_current[FEED_PLAN_MAX_PHASES] = {0};
 static uint32_t feed_plan_input_duration_us = 0U;
 // Дополнительное время на перестройку источника питания, мкс.
 // Оно вводится отдельной строкой после активной длительности фазы.
@@ -178,17 +194,24 @@ static void feed_plan_process_input_line(char **argv, int argc);
 // Разбор десятичного uint32_t.
 static bool parse_uint32_dec_token(const char *token, uint32_t *value);
 
-// Разбор строки напряжений или токов.
-static bool parse_feed_plan_values_line(char **argv,
-                                        int argc,
-                                        uint8_t expected_count,
-                                        uint8_t *dst);
+// Разбор строки напряжений фаз, В.
+static bool parse_feed_plan_voltage_line(char **argv,
+                                         int argc,
+                                         uint8_t expected_count,
+                                         uint8_t *dst);
+
+// Разбор строки токов фаз, мА.
+static bool parse_feed_plan_current_line(char **argv,
+                                         int argc,
+                                         uint8_t expected_count,
+                                         uint16_t *dst);
 
 // Разбор битовой маски одного ведомого устройства.
 static bool parse_feed_plan_mask_line(const char *token,
                                       uint8_t phase_count,
                                       uint32_t *mask_out);
-
+// Разбор команды ручного тестирования PPE-3323.
+static void ppe_process_input_command(char **argv, int argc);
 // ============================================================================
 // Отправка ответа в COM-порт
 // ============================================================================
@@ -253,6 +276,14 @@ void comport_clear_command(void)
     comport_command_ready = 0U;
 }
 
+void comport_clear_ppe_command(void)
+{
+    ppe_command_ready = 0U;
+    ppe_command_type = PPE_COMMAND_NONE;
+
+    ppe_command_voltage_v = 0U;
+    ppe_command_current_ma = 0U;
+}
 
 // ============================================================================
 // Разбор одной строки из COM-порта
@@ -365,7 +396,17 @@ void comport_process_line(char *line)
         feed_plan_input_start();
         return;
     }
-
+    /*
+     * Ручные команды PPE-3323.
+     *
+     * Они используются только для проверки связи USART1 → MAX3232 → PPE-3323.
+     * Автоматическое управление источником из фазы питания добавится позже.
+     */
+    if (str_eq_ci(argv[0], "PPE"))
+    {
+        ppe_process_input_command(argv, argc);
+        return;
+    }
     // Если один пакет уже разобран, но main.c ещё не успел его запустить,
     // новую строку с пакетом принимать нельзя.
     if (comport_command_ready)
@@ -796,13 +837,12 @@ static bool parse_uint32_dec_token(const char *token, uint32_t *value)
 }
 
 
-// ========== Разбор строки напряжений или токов ==========
-// В строке должно быть ровно expected_count чисел.
-// Каждое число должно помещаться в uint8_t.
-static bool parse_feed_plan_values_line(char **argv,
-                                        int argc,
-                                        uint8_t expected_count,
-                                        uint8_t *dst)
+// ========== Разбор строки напряжений фаз ==========
+// Значения вводятся в вольтах и должны быть не больше 32 В.
+static bool parse_feed_plan_voltage_line(char **argv,
+                                         int argc,
+                                         uint8_t expected_count,
+                                         uint8_t *dst)
 {
     if ((argv == NULL) || (dst == NULL))
     {
@@ -823,7 +863,7 @@ static bool parse_feed_plan_values_line(char **argv,
             return false;
         }
 
-        if (value > 255U)
+        if (value > POWER_SOURCE_MAX_VOLTAGE_V)
         {
             return false;
         }
@@ -834,6 +874,43 @@ static bool parse_feed_plan_values_line(char **argv,
     return true;
 }
 
+
+// ========== Разбор строки токов фаз ==========
+// Значения вводятся в миллиамперах и должны быть не больше 3000 мА.
+static bool parse_feed_plan_current_line(char **argv,
+                                         int argc,
+                                         uint8_t expected_count,
+                                         uint16_t *dst)
+{
+    if ((argv == NULL) || (dst == NULL))
+    {
+        return false;
+    }
+
+    if (argc != expected_count)
+    {
+        return false;
+    }
+
+    for (uint8_t i = 0U; i < expected_count; i++)
+    {
+        uint32_t value = 0U;
+
+        if (!parse_uint32_dec_token(argv[i], &value))
+        {
+            return false;
+        }
+
+        if (value > POWER_SOURCE_MAX_CURRENT_MA)
+        {
+            return false;
+        }
+
+        dst[i] = (uint16_t)value;
+    }
+
+    return true;
+}
 
 // ========== Разбор битовой маски одного ведомого устройства ==========
 // Длина строки должна быть равна количеству фаз.
@@ -917,11 +994,10 @@ static void feed_plan_process_input_line(char **argv, int argc)
     if (feed_plan_input_step == FEED_PLAN_INPUT_VOLTAGES)
     {
         // Строка напряжений: ровно N чисел.
-        if (!parse_feed_plan_values_line(argv,
-                                         argc,
-                                         feed_plan_input_phase_count,
-                                         feed_plan_input_voltage))
-        {
+    	if (!parse_feed_plan_voltage_line(argv,
+    	                                  argc,
+    	                                  feed_plan_input_phase_count,
+    	                                  feed_plan_input_voltage)){
             feed_plan_input_fail();
             return;
         }
@@ -933,10 +1009,10 @@ static void feed_plan_process_input_line(char **argv, int argc)
     if (feed_plan_input_step == FEED_PLAN_INPUT_CURRENTS)
     {
         // Строка токов: ровно N чисел.
-        if (!parse_feed_plan_values_line(argv,
-                                         argc,
-                                         feed_plan_input_phase_count,
-                                         feed_plan_input_current))
+    	if (!parse_feed_plan_current_line(argv,
+    	                                  argc,
+    	                                  feed_plan_input_phase_count,
+    	                                  feed_plan_input_current))
         {
             feed_plan_input_fail();
             return;
@@ -1082,6 +1158,108 @@ void comport_print_received_data(void)
     comport_send_response("\r\n");
 }
 
+// ========== Разбор команд ручного тестирования PPE-3323 ==========
+static void ppe_process_input_command(char **argv, int argc)
+{
+    uint32_t voltage_v = 0U;
+    uint32_t current_ma = 0U;
+
+    if ((argv == NULL) || (argc < 2))
+    {
+        comport_send_response("Error: PPE command is incomplete\r\n");
+        return;
+    }
+
+    /*
+     * Нельзя подготовить новую команду, пока предыдущая
+     * ещё не обработана main.c.
+     */
+    if ((ppe_command_ready != 0U) ||
+        (comport_command_ready != 0U))
+    {
+        comport_send_response("Error: previous command is not processed yet\r\n");
+        return;
+    }
+
+    if (str_eq_ci(argv[1], "SET"))
+    {
+        /*
+         * Формат:
+         *
+         * PPE SET <напряжение_В> <ток_мА>
+         *
+         * Пример:
+         * PPE SET 12 100
+         */
+        if (argc != 4)
+        {
+            comport_send_response("Error: use PPE SET <V> <mA>\r\n");
+            return;
+        }
+
+        if (!parse_uint32_dec_token(argv[2], &voltage_v) ||
+            !parse_uint32_dec_token(argv[3], &current_ma))
+        {
+            comport_send_response("Error: PPE values must be decimal\r\n");
+            return;
+        }
+
+        if ((voltage_v > POWER_SOURCE_MAX_VOLTAGE_V) ||
+            (current_ma > POWER_SOURCE_MAX_CURRENT_MA))
+        {
+            comport_send_response("Error: PPE value is out of range\r\n");
+            return;
+        }
+
+        ppe_command_type = PPE_COMMAND_SET;
+        ppe_command_voltage_v = (uint8_t)voltage_v;
+        ppe_command_current_ma = (uint16_t)current_ma;
+
+        ppe_command_ready = 1U;
+        return;
+    }
+
+    if (str_eq_ci(argv[1], "ON"))
+    {
+        if (argc != 2)
+        {
+            comport_send_response("Error: use PPE ON\r\n");
+            return;
+        }
+
+        ppe_command_type = PPE_COMMAND_ON;
+        ppe_command_ready = 1U;
+        return;
+    }
+
+    if (str_eq_ci(argv[1], "OFF"))
+    {
+        if (argc != 2)
+        {
+            comport_send_response("Error: use PPE OFF\r\n");
+            return;
+        }
+
+        ppe_command_type = PPE_COMMAND_OFF;
+        ppe_command_ready = 1U;
+        return;
+    }
+
+    if (str_eq_ci(argv[1], "STATUS"))
+    {
+        if (argc != 2)
+        {
+            comport_send_response("Error: use PPE STATUS\r\n");
+            return;
+        }
+
+        ppe_command_type = PPE_COMMAND_STATUS;
+        ppe_command_ready = 1U;
+        return;
+    }
+
+    comport_send_response("Error: unknown PPE command\r\n");
+}
 
 // ============================================================================
 // Внутренние функции парсера
@@ -1459,6 +1637,10 @@ static void print_help(void)
     comport_send_response("  STATUS\r\n");
     comport_send_response("  FOUND\r\n");
     comport_send_response("  RXDATA\r\n");
+    comport_send_response("  PPE SET <V> <mA>\r\n");
+    comport_send_response("  PPE ON\r\n");
+    comport_send_response("  PPE OFF\r\n");
+    comport_send_response("  PPE STATUS\r\n");
     comport_send_response("\r\n");
 
     comport_send_response("Examples:\r\n");
@@ -1479,4 +1661,8 @@ static void print_help(void)
     comport_send_response("  MASK for ROM[0]\r\n");
     comport_send_response("  MASK for ROM[1]\r\n");
     comport_send_response("  ...\r\n");
+    comport_send_response("  U values: volts, 0...32\r\n");
+    comport_send_response("  I values: milliamperes, 0...3000\r\n");
+
+
 }

@@ -24,7 +24,14 @@ extern TIM_HandleTypeDef htim2;
 #define TIMESLOT_US     70U
 #define CRC5_POLY       0x05U
 #define ROM_ID_LEN      4U
-#define POWER_PHASE_US  10000U
+/*
+ * Короткая имитационная фаза питания.
+ *
+ * Используется до первого успешного поиска устройств и во время
+ * передачи пакетов FEED_PLAN. Она разделяет сегменты протокола,
+ * но не подключает к линии реальный источник питания.
+ */
+#define SIMULATED_POWER_PHASE_US  10000U
 
 #define MAX_FOUND_DEVICES          16U
 #define SEARCH_GROUPS_PER_SEGMENT  5U
@@ -132,6 +139,15 @@ extern uint8_t received_data_count;
 // Маска фаз хранится в uint32_t, поэтому максимум – 32 фазы.
 #define FEED_PLAN_MAX_PHASES       32U
 
+/*
+ * Ограничения первого регулируемого выхода PPE-3323.
+ *
+ * План питания на данном этапе управляет только OUT1:
+ * напряжение от 0 до 32 В;
+ * ограничение тока от 0 до 3000 мА.
+ */
+#define POWER_SOURCE_MAX_VOLTAGE_V    32U
+#define POWER_SOURCE_MAX_CURRENT_MA   3000U
 
 // ===== План питания, полученный от ПК =====
 // План принимается от ПК, сохраняется в памяти мастера,
@@ -149,9 +165,13 @@ typedef struct
     // Пользователь вводит значения без единиц измерения.
     uint8_t phase_voltage[FEED_PLAN_MAX_PHASES];
 
-    // Ток каждой фазы.
-    // Пользователь вводит значения без единиц измерения.
-    uint8_t phase_current[FEED_PLAN_MAX_PHASES];
+    /*
+     * Ток каждой фазы, мА.
+     *
+     * uint16_t используется потому, что PPE-3323 позволяет задавать
+     * ток до 3000 мА, а uint8_t ограничен значением 255.
+     */
+    uint16_t phase_current[FEED_PLAN_MAX_PHASES];
 
     // Полезная длительность активного питания одной фазы, мкс.
     // Это время вводится с ПК как основное время питания.
@@ -180,6 +200,19 @@ typedef struct
 // План питания, сохранённый в микроконтроллере.
 extern feed_plan_data_t feed_plan_data;
 
+// ===== Признаки готовности к реальной фазе питания =====
+// Возвращает 1, если в актуальном списке найден хотя бы один ведомый.
+// Признак сбрасывается при полном сбросе или новом полном поиске.
+bool protocol_search_found_once(void);
+
+// Возвращает 1, если индивидуальные пакеты FEED_PLAN успешно
+// переданы всем ведомым устройствам из актуального списка.
+bool protocol_feed_plan_sent_ok(void);
+
+// Возвращает 1, если одновременно выполнены оба условия:
+// найдено хотя бы одно устройство и FEED_PLAN передан всем ведомым.
+
+bool protocol_real_power_phase_enabled(void);
 
 // Сброс сохранённого плана питания.
 void feed_plan_reset(void);
@@ -189,7 +222,7 @@ void feed_plan_reset(void);
 // Функция вызывается из comport.c после успешного разбора всех строк.
 bool feed_plan_store(uint8_t phase_count,
                      const uint8_t *phase_voltage,
-                     const uint8_t *phase_current,
+                     const uint16_t *phase_current,
                      uint32_t phase_duration_us,
                      uint32_t phase_extra_duration_us,
                      const uint32_t *device_masks,

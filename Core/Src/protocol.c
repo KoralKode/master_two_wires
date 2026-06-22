@@ -1,5 +1,6 @@
 #include "protocol.h"
 #include <string.h>
+#include "main.h"
 // ===== Формат передаваемых данных FEED_PLAN =====
 // Максимум фаз – 32, поэтому маска занимает максимум 4 байта.
 //
@@ -88,8 +89,57 @@ static uint8_t current_slave_id[ROM_ID_LEN] = {0};
 static uint8_t addr_index = 0;
 
 // ===== Фаза питания =====
-static uint16_t phase_ticks = 0;
+// Счётчик хранит количество прерываний TIM2 длительностью 35 мкс.
+// uint32_t нужен, потому что реальная фаза может включать
+// дополнительное время перестройки источника, например 250000 мкс.
+static uint32_t phase_ticks = 0U;
 static state_t next_state_after_phase = IDLE;
+
+/*
+ * Номер следующей реальной фазы в принятом плане питания.
+ *
+ * При первой реальной фазе используется индекс 0.
+ * После завершения фазы индекс увеличивается и циклически
+ * возвращается к нулю после последней фазы.
+ */
+static volatile uint8_t real_power_phase_index = 0U;
+
+/*
+ * Признак того, что выполняемая сейчас фаза является временной моделью
+ * реальной фазы питания, а не короткой имитационной фазой.
+ *
+ * Он фиксируется при запуске фазы, чтобы изменение внешних признаков
+ * не влияло на уже начавшийся временной интервал.
+ */
+static volatile uint8_t active_real_power_phase = 0U;
+
+/*
+ * Индекс фазы, которая выполняется в данный момент.
+ * На следующем этапе этот индекс понадобится для выбора напряжения
+ * и тока PPE-3323.
+ */
+static volatile uint8_t active_real_power_phase_index = 0U;
+
+/*
+ * Внутреннее состояние выполняемой фазы питания.
+ *
+ * В имитационном режиме используется только
+ * POWER_PHASE_STAGE_SIMULATED.
+ *
+ * В реальном режиме фаза состоит из двух частей:
+ * POWER_PHASE_STAGE_REAL_EXTRA  – ключ выключен, источник перестраивается;
+ * POWER_PHASE_STAGE_REAL_ACTIVE – ключ включён, линия получает питание.
+ */
+typedef enum
+{
+    POWER_PHASE_STAGE_NONE = 0U,
+    POWER_PHASE_STAGE_SIMULATED,
+    POWER_PHASE_STAGE_REAL_EXTRA,
+    POWER_PHASE_STAGE_REAL_ACTIVE
+} power_phase_stage_t;
+
+static volatile power_phase_stage_t power_phase_stage =
+        POWER_PHASE_STAGE_NONE;
 
 // ===== Повтор сегмента при ошибке CRC =====
 static uint8_t retry_needed = 0;
@@ -139,6 +189,20 @@ static uint8_t feed_plan_send_index = 0U;
 // Он static, потому что send_pack_async() хранит указатель на данные,
 // а пакет передаётся асинхронно через прерывания таймера.
 static uint8_t feed_plan_tx_data[FEED_PLAN_TX_DATA_MAX_SIZE] = {0};
+
+// ===== Готовность к реальной фазе питания =====
+// Первый признак устанавливается после успешного обычного ROM-search,
+// когда в found_roms[] есть хотя бы один адрес.
+static volatile uint8_t search_found_once = 0U;
+
+// Второй признак устанавливается только после того, как все пакеты
+// FEED_PLAN успешно переданы ведомым устройствам.
+static volatile uint8_t feed_plan_sent_ok = 0U;
+
+// Реальная фаза питания может быть разрешена только при выполнении
+// обоих условий. На этапе 1 этот признак не меняет длительность
+// и способ выполнения фазы: используется прежняя имитационная фаза.
+static volatile uint8_t real_power_phase_enabled = 0U;
 
 // ===== Состояние внутренней процедуры запроса параметров =====
 // 1 – сейчас выполняется последовательный запрос PARAMETERS
@@ -233,6 +297,12 @@ volatile uint8_t protocol_packet_aborted_by_alarm = 0U;
 #define DATA_LOW()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET)
 #define DATA_READ()  HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_0)
 
+/*
+ * TIM2 вызывает protocol_timer_irq_handler() каждые 35 мкс,
+ * то есть в два раза чаще длительности одного тайм-слота.
+ */
+#define POWER_PHASE_TIMER_TICK_US  (TIMESLOT_US / 2U)
+
 // ========== Внутренние прототипы ==========
 static void next_step(void);
 static void on_segment_done(void);
@@ -240,7 +310,15 @@ static void on_received_segment_done(void);
 
 static void start_timer(void);
 static void stop_timer(void);
+
 static void start_power_phase(state_t next_state);
+static void update_real_power_phase_enabled(void);
+static uint32_t power_phase_us_to_timer_ticks(uint32_t duration_us);
+static void advance_real_power_phase(void);
+
+static void power_key_on(void);
+static void power_key_off(void);
+static void start_real_power_active_part(void);
 
 static bool rom_cmd_has_address(uint8_t rom_cmd);
 
@@ -304,22 +382,272 @@ static  void stop_timer(void) {
     HAL_TIM_Base_Stop_IT(&htim2);       // останавливаем таймер
 }
 
+// ========== Управление внешним ключом питания ==========
+
+/*
+ * Отключение источника питания от линии данных.
+ *
+ * Эта функция должна вызываться по умолчанию:
+ * при запуске программы, перед началом любой фазы,
+ * после завершения активной части фазы и при тревоге.
+ */
+static void power_key_off(void)
+{
+    HAL_GPIO_WritePin(POWER_KEY_GPIO_Port,
+                      POWER_KEY_Pin,
+                      POWER_KEY_OFF_LEVEL);
+}
+
+
+/*
+ * Подключение источника питания к линии данных.
+ *
+ * На текущем этапе этот GPIO только формирует тестовый сигнал.
+ * Реальное подключение PPE-3323 через внешний ключ будет добавлено
+ * после подключения UART и проверки аппаратной части.
+ */
+static void power_key_on(void)
+{
+    HAL_GPIO_WritePin(POWER_KEY_GPIO_Port,
+                      POWER_KEY_Pin,
+                      POWER_KEY_ON_LEVEL);
+}
+
 //функция показывающая нужено ли отправлять адрес
 static bool rom_cmd_has_address(uint8_t rom_cmd) {
     return (rom_cmd == ROM_MATCH_CMD);
 }
 
-//функция для начала фазы питания
-static void start_power_phase(state_t next_state) {
+// ========== Обновление разрешения реальной фазы питания ==========
+// Реальная фаза будет добавлена на следующих этапах.
+// Пока признак нужен только для правильного выбора момента перехода:
+// после успешного поиска и после передачи FEED_PLAN всем ведомым.
+static void update_real_power_phase_enabled(void)
+{
+    real_power_phase_enabled =
+            ((search_found_once != 0U) && (feed_plan_sent_ok != 0U)) ?
+            1U : 0U;
+}
+
+
+// ========== Признаки готовности к реальной фазе питания ==========
+bool protocol_search_found_once(void)
+{
+    return (search_found_once != 0U);
+}
+
+bool protocol_feed_plan_sent_ok(void)
+{
+    return (feed_plan_sent_ok != 0U);
+}
+
+bool protocol_real_power_phase_enabled(void)
+{
+    return (real_power_phase_enabled != 0U);
+}
+
+
+// ========== Перевод длительности фазы в количество прерываний TIM2 ==========
+static uint32_t power_phase_us_to_timer_ticks(uint32_t duration_us)
+{
+    uint32_t ticks;
+
+    /*
+     * Обработчик TIM2 вызывается каждые 35 мкс.
+     * Округляем количество тиков вверх, чтобы фактическая фаза
+     * не была короче времени, заданного в плане питания.
+     */
+    ticks = duration_us / POWER_PHASE_TIMER_TICK_US;
+
+    if ((duration_us % POWER_PHASE_TIMER_TICK_US) != 0U)
+    {
+        ticks++;
+    }
+
+    /*
+     * Защита от нулевой длительности.
+     * В нормальной работе она не требуется, но не позволит автомату
+     * мгновенно завершить фазу при ошибочных входных данных.
+     */
+    if (ticks == 0U)
+    {
+        ticks = 1U;
+    }
+
+    return ticks;
+}
+
+/*
+ * Запуск активной части реальной фазы питания.
+ *
+ * До вызова этой функции уже должно пройти
+ * phase_extra_duration_us – время перестройки источника.
+ *
+ * На данном этапе PB1 становится равным единице только как
+ * управляющий и тестовый сигнал. В дальнейшем он включит
+ * внешний ключ между PPE-3323 и линией данных.
+ */
+static void start_real_power_active_part(void)
+{
+    /*
+     * Перед включением ключа линия уже отпущена в start_power_phase()
+     * через DATA_HIGH(). Поэтому STM32 не удерживает её в нуле.
+     */
+    power_key_on();
+
+    power_phase_stage = POWER_PHASE_STAGE_REAL_ACTIVE;
+
+    /*
+     * После дополнительного времени начинается активное питание.
+     * Длительность phase_duration_us проверяется при приёме плана
+     * и должна быть больше нуля.
+     */
+    phase_ticks =
+            power_phase_us_to_timer_ticks(
+                    feed_plan_data.phase_duration_us);
+}
+
+// ========== Начало фазы питания ==========
+static void start_power_phase(state_t next_state)
+{
+    /*
+     * При старте любой фазы источник должен быть отключён от линии.
+     *
+     * Это безопасное состояние используется:
+     * - при имитационной фазе;
+     * - во время перестройки PPE-3323;
+     * - перед переходом к следующему сегменту.
+     */
+    power_key_off();
+
+    /*
+     * PB0 должен быть отпущен.
+     *
+     * В имитационном режиме это сохраняет прежнюю работу протокола.
+     * В реальном режиме это необходимо перед подключением источника
+     * через внешний ключ.
+     */
     DATA_HIGH();
 
-    phase_ticks = (POWER_PHASE_US + TIMESLOT_US - 1U) / TIMESLOT_US;
-    phase_ticks *= 2U;          // таймер идёт в 2 раза чаще чем 70 мкс
     next_state_after_phase = next_state;
-    half_slot_phase = 0;
+    half_slot_phase = 0U;
+
+    /*
+     * Реальная фаза возможна только после:
+     * - успешного поиска хотя бы одного ведомого;
+     * - успешной передачи FEED_PLAN всем ведомым;
+     * - при наличии корректного плана питания.
+     *
+     * Во время обработки тревоги реальная фаза запрещается:
+     * ключ должен оставаться выключенным.
+     */
+    if ((real_power_phase_enabled != 0U) &&
+        (feed_plan_data.valid != 0U) &&
+        (feed_plan_data.phase_count != 0U) &&
+        (feed_plan_data.phase_count <= FEED_PLAN_MAX_PHASES) &&
+        (alarm_pending == 0U) &&
+        (alarm_processing == 0U))
+    {
+        /*
+         * При некорректном индексе начинаем цикл питания
+         * заново с первой фазы.
+         */
+        if (real_power_phase_index >= feed_plan_data.phase_count)
+        {
+            real_power_phase_index = 0U;
+        }
+
+        active_real_power_phase = 1U;
+        active_real_power_phase_index = real_power_phase_index;
+
+        /*
+         * Если дополнительное время равно нулю, активную часть
+         * можно начать сразу.
+         */
+        if (feed_plan_data.phase_extra_duration_us == 0U)
+        {
+            start_real_power_active_part();
+        }
+        else
+        {
+            /*
+             * Первая часть реальной фазы:
+             * источник отключён от линии и имеет время
+             * на перестройку напряжения и ограничения тока.
+             */
+            power_phase_stage = POWER_PHASE_STAGE_REAL_EXTRA;
+
+            phase_ticks =
+                    power_phase_us_to_timer_ticks(
+                            feed_plan_data.phase_extra_duration_us);
+        }
+    }
+    else
+    {
+        /*
+         * До передачи FEED_PLAN применяется короткая имитационная фаза.
+         *
+         * Она используется при первом поиске, получении PARAMETERS
+         * и во время передачи самих пакетов FEED_PLAN.
+         */
+        active_real_power_phase = 0U;
+        active_real_power_phase_index = 0U;
+        real_power_phase_index = 0U;
+
+        power_phase_stage = POWER_PHASE_STAGE_SIMULATED;
+
+        phase_ticks =
+                power_phase_us_to_timer_ticks(
+                        SIMULATED_POWER_PHASE_US);
+    }
+
     global_state = SEQ_WAIT_PHASE;
     start_timer();
 }
+
+// ========== Переход к следующей реальной фазе питания ==========
+static void advance_real_power_phase(void)
+{
+    /*
+     * Имитационная фаза не относится к плану питания,
+     * поэтому её завершение не меняет номер фазы.
+     */
+    if (active_real_power_phase == 0U)
+    {
+        return;
+    }
+
+    /*
+     * Если план был сброшен во время ожидания фазы,
+     * дальнейшее выполнение цикла питания запрещается.
+     */
+    if ((!feed_plan_data.valid) ||
+        (feed_plan_data.phase_count == 0U) ||
+        (feed_plan_data.phase_count > FEED_PLAN_MAX_PHASES))
+    {
+        real_power_phase_index = 0U;
+        active_real_power_phase = 0U;
+        active_real_power_phase_index = 0U;
+
+        return;
+    }
+
+    /*
+     * После завершения фазы переходим к следующей.
+     * После последней фазы снова используется фаза с индексом 0.
+     */
+    real_power_phase_index =
+            (uint8_t)(active_real_power_phase_index + 1U);
+
+    if (real_power_phase_index >= feed_plan_data.phase_count)
+    {
+        real_power_phase_index = 0U;
+    }
+
+    active_real_power_phase = 0U;
+}
+
+
 
 
 
@@ -475,6 +803,16 @@ static void handle_service_flags_after_segment(void)
     // Если alarm и interrupt пришли одновременно, interrupt не фиксируем.
     if (rx_flags & 0x01U)
     {
+        /*
+         * Тревога имеет приоритет над обычным обменом.
+         *
+         * Ключ отключается сразу, ещё до запуска ROM-alarm.
+         * На текущем этапе это выключает тестовый GPIO PB1.
+         * После подключения оборудования это сразу отсоединит
+         * PPE-3323 от линии данных.
+         */
+        power_key_off();
+
         alarm_pending = 1U;
 
         // Обычное прерывание не должно быть обработано раньше alarm.
@@ -541,6 +879,10 @@ void search_rom_packet_reset(void)
     clear_rom_list(found_roms, &found_rom_count);
     clear_rom_list(interrupt_roms, &interrupt_rom_count);
     clear_rom_list(alarm_roms, &alarm_rom_count);
+    // После полного сброса актуального списка устройств нет.
+    // Поэтому реальная фаза питания не может быть разрешена.
+    search_found_once = 0U;
+    update_real_power_phase_enabled();
 
     // Полный сброс поиска должен также очищать параметры питания,
     // потому что они связаны с адресами из found_roms[] по индексу.
@@ -741,6 +1083,11 @@ static bool search_packet_async_with_cmd(uint8_t rom_cmd,
         if (clear_result_array)
         {
             clear_rom_list(found_roms, &found_rom_count);
+
+            // Новый полный поиск начинает формирование списка заново.
+            // До успешного окончания поиска реальная фаза питания запрещена.
+            search_found_once = 0U;
+            update_real_power_phase_enabled();
 
             // При полном новом поиске адресов старые параметры питания
             // больше не считаются актуальными, потому что список found_roms[]
@@ -1166,7 +1513,18 @@ static void next_step(void) {
             	clear_search_active_flags();
                 search_done = 1U;
                 search_success = (search_get_current_result_count() > 0U) ? 1U : 0U;
-
+                /*
+                 * Для обычного ROM-search фиксируем, что существует
+                 * актуальный список хотя бы с одним ведомым устройством.
+                 *
+                 * Поиск по флагу прерывания и ROM-alarm этот признак
+                 * не изменяют, так как они не формируют found_roms[].
+                 */
+                if (search_result_target == SEARCH_RESULT_FOUND)
+                {
+                    search_found_once = (found_rom_count > 0U) ? 1U : 0U;
+                    update_real_power_phase_enabled();
+                }
                 global_state = SEQ_END;
                 next_step();
             }
@@ -1509,6 +1867,24 @@ void feed_plan_reset(void)
     // Полностью очищаем сохранённый план.
     memset(&feed_plan_data, 0, sizeof(feed_plan_data));
 
+    // После сброса плана ведомые больше не имеют актуальных
+    // индивидуальных масок и суммарной длительности фазы.
+    // Поэтому реальная фаза питания должна быть запрещена.
+    feed_plan_sent_ok = 0U;
+    update_real_power_phase_enabled();
+
+    /*
+     * После сброса плана следующая передача нового плана
+     * должна начинать цикл питания с нулевой фазы.
+     */
+    real_power_phase_index = 0U;
+    active_real_power_phase = 0U;
+    active_real_power_phase_index = 0U;
+
+    // При сбросе плана ключ всегда переводится в безопасное состояние.
+    power_phase_stage = POWER_PHASE_STAGE_NONE;
+    power_key_off();
+
     // Если в момент сброса шла передача плана ведомым,
     // внутреннее состояние передачи также сбрасывается.
     feed_plan_send_reset_state();
@@ -1521,7 +1897,7 @@ void feed_plan_reset(void)
 // Она только сохраняет данные, полученные от ПК через COM-порт.
 bool feed_plan_store(uint8_t phase_count,
                      const uint8_t *phase_voltage,
-                     const uint8_t *phase_current,
+                     const uint16_t *phase_current,
                      uint32_t phase_duration_us,
                      uint32_t phase_extra_duration_us,
                      const uint32_t *device_masks,
@@ -1558,6 +1934,25 @@ bool feed_plan_store(uint8_t phase_count,
         (device_masks == NULL))
     {
         return false;
+    }
+
+    /*
+     * Проверяем, что каждая фаза соответствует пределам OUT1 PPE-3323.
+     *
+     * Эта проверка остаётся в protocol.c, чтобы план нельзя было
+     * записать с недопустимыми значениями даже при обходе COM-порта.
+     */
+    for (uint8_t i = 0U; i < phase_count; i++)
+    {
+        if (phase_voltage[i] > POWER_SOURCE_MAX_VOLTAGE_V)
+        {
+            return false;
+        }
+
+        if (phase_current[i] > POWER_SOURCE_MAX_CURRENT_MA)
+        {
+            return false;
+        }
     }
 
     // Перед записью нового плана очищаем старый.
@@ -1722,7 +2117,10 @@ static bool feed_plan_start_next_slave(void)
     // Все ведомые получили свои индивидуальные маски.
     feed_plan_send_processing = 0U;
     feed_plan_send_waiting_packet = 0U;
-
+    // Только после успешного завершения всех индивидуальных пакетов
+    // FEED_PLAN можно разрешить переход к реальной фазе питания.
+    feed_plan_sent_ok = 1U;
+    update_real_power_phase_enabled();
     protocol_event_type = PROTOCOL_EVENT_FEED_PLAN_SENT;
 
     return true;
@@ -1759,7 +2157,21 @@ static void feed_plan_continue_sending(void)
         }
     }
 
-    (void)feed_plan_start_next_slave();
+    if (!feed_plan_start_next_slave())
+    {
+        /*
+         * Очередной пакет FEED_PLAN не удалось запустить.
+         * План не считается переданным всем ведомым,
+         * поэтому реальная фаза питания остаётся запрещённой.
+         */
+        feed_plan_send_reset_state();
+
+        feed_plan_sent_ok = 0U;
+        update_real_power_phase_enabled();
+
+        power_phase_stage = POWER_PHASE_STAGE_NONE;
+        power_key_off();
+    }
 }
 
 
@@ -1795,6 +2207,25 @@ bool feed_plan_send_all_async(void)
     {
         return false;
     }
+    // Начинается новая передача плана. До её полного завершения
+    // ранее переданный план не считается подтверждённым для реальной фазы.
+    feed_plan_sent_ok = 0U;
+    update_real_power_phase_enabled();
+
+    /*
+     * После успешной передачи нового плана выполнение цикла питания
+     * всегда должно начаться с первой фазы – фазы с индексом 0.
+     */
+    real_power_phase_index = 0U;
+    active_real_power_phase = 0U;
+    active_real_power_phase_index = 0U;
+
+    /*
+     * Пока передаётся новый FEED_PLAN, реальное питание запрещено.
+     * Ключ должен оставаться выключенным.
+     */
+    power_phase_stage = POWER_PHASE_STAGE_NONE;
+    power_key_off();
 
     feed_plan_send_processing = 1U;
     feed_plan_send_waiting_packet = 0U;
@@ -2524,8 +2955,13 @@ void protocol_timer_irq_handler(TIM_HandleTypeDef *htim)
     case SEG_SEND_CRC_ACK:
         if (half_slot_phase == 0U)
         {
-            // 1 – принятый CRC верен
-            // 0 – CRC неверен, ведомый должен повторить сегмент
+            /*
+             * 1 – принятый CRC корректен.
+             * 0 – CRC неверен, ведомый должен повторить сегмент.
+             *
+             * Значение подтверждения устанавливается в начале
+             * последнего тайм-слота сегмента.
+             */
             if (rx_crc_ok)
             {
                 DATA_HIGH();
@@ -2539,17 +2975,40 @@ void protocol_timer_irq_handler(TIM_HandleTypeDef *htim)
         }
         else
         {
-            // ВАЖНО: здесь не делаем DATA_HIGH(),
-            // чтобы не укоротить ACK/NACK внутри тайм-слота.
-            // Линия будет гарантированно отпущена в start_power_phase().
+            /*
+             * Вторая половина тайм-слота подтверждения CRC.
+             *
+             * Здесь нельзя завершать сегмент и запускать фазу питания,
+             * потому что start_power_phase() отпускает линию через DATA_HIGH().
+             * Иначе NACK будет удерживаться только половину тайм-слота.
+             *
+             * Переходим в отдельное состояние завершения, которое сработает
+             * после ещё одного полутакта TIM2. Благодаря этому ACK/NACK
+             * сохраняется на линии полные 70 мкс.
+             */
             half_slot_phase = 0U;
-
-            stop_timer();
-            global_state = IDLE;
-            on_received_segment_done();
+            global_state = SEG_COMPLETE;
         }
         break;
+    case SEG_COMPLETE:
+        /*
+         * Полный тайм-слот CRC ACK/NACK завершён.
+         *
+         * Линию нужно отпустить сразу в начале этого обработчика.
+         * Иначе DATA_HIGH() будет вызван только внутри start_power_phase()
+         * после выполнения нескольких функций, и длительность NACK
+         * станет больше 70 мкс.
+         */
+        DATA_HIGH();
 
+        /*
+         * После отпускания линии можно безопасно завершить сегмент
+         * и перейти к следующей фазе или следующему сегменту.
+         */
+        stop_timer();
+        global_state = IDLE;
+        on_received_segment_done();
+        break;
     case SSEG_START_BIT:
         if (half_slot_phase == 0U)
         {
@@ -2664,8 +3123,42 @@ void protocol_timer_irq_handler(TIM_HandleTypeDef *htim)
 
         if (phase_ticks == 0U)
         {
+            /*
+             * Завершилось дополнительное время реальной фазы.
+             *
+             * Теперь включаем ключ и начинаем активное питание.
+             * Таймер не останавливается: сразу начинается отсчёт
+             * phase_duration_us.
+             */
+            if (power_phase_stage == POWER_PHASE_STAGE_REAL_EXTRA)
+            {
+                start_real_power_active_part();
+                break;
+            }
+
+            /*
+             * Завершилась активная часть реальной фазы
+             * или обычная имитационная фаза.
+             *
+             * Перед продолжением протокола источник обязательно
+             * отключается от линии.
+             */
+            power_key_off();
+
             stop_timer();
             half_slot_phase = 0U;
+
+            /*
+             * Индекс следующей фазы меняется только после завершения
+             * активной части реальной фазы.
+             */
+            if (power_phase_stage == POWER_PHASE_STAGE_REAL_ACTIVE)
+            {
+                advance_real_power_phase();
+            }
+
+            power_phase_stage = POWER_PHASE_STAGE_NONE;
+
             global_state = next_state_after_phase;
             next_step();
         }
@@ -2682,7 +3175,8 @@ void protocol_init(void)
     // Линия данных по умолчанию должна быть отпущена.
     // Так как выход open-drain, DATA_HIGH() фактически отпускает линию.
     DATA_HIGH();
-
+    // Источник питания при запуске должен быть отключён от линии.
+    power_key_off();
     // Основной автомат находится в состоянии ожидания.
     global_state = IDLE;
     current_seq_state = IDLE;
@@ -2692,6 +3186,13 @@ void protocol_init(void)
     retry_needed = 0U;
     rx_flags = 0U;
 
+    // Начальное состояние фазы питания.
+    phase_ticks = 0U;
+    next_state_after_phase = IDLE;
+    real_power_phase_index = 0U;
+    active_real_power_phase = 0U;
+    active_real_power_phase_index = 0U;
+    power_phase_stage = POWER_PHASE_STAGE_NONE;
     // Сброс режима приёма.
     receive_packet_active = 0U;
     clear_received_data();

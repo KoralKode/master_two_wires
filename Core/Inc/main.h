@@ -57,9 +57,22 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define POWER_KEY_Pin GPIO_PIN_1
+#define POWER_KEY_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
-
+/*
+ * Логические уровни управления внешним ключом питания.
+ *
+ * Сейчас принято:
+ * GPIO_PIN_SET   – подключить источник к линии;
+ * GPIO_PIN_RESET – отключить источник от линии.
+ *
+ * Если будущая аппаратная схема ключа окажется активной по нулю,
+ * достаточно поменять значения этих двух макросов местами.
+ */
+#define POWER_KEY_ON_LEVEL   GPIO_PIN_SET
+#define POWER_KEY_OFF_LEVEL  GPIO_PIN_RESET
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus
