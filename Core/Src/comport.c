@@ -275,6 +275,18 @@ void comport_poll(void)
     while (USBD_CDC_GetLine(line, sizeof(line)) > 0U)
     {
         comport_process_line(line);
+
+        /*
+         * Если обработанная команда запустила пакет протокола,
+         * дальнейшие строки очереди не трогаем до завершения пакета.
+         *
+         * Это исключает выполнение USB-разбора во время передачи
+         * первого сегмента ROM_MATCH.
+         */
+        if (protocol_is_busy())
+        {
+            break;
+        }
     }
 }
 
@@ -1012,19 +1024,42 @@ static void feed_plan_process_single_line(char **argv, int argc)
         }
 
         /*
-         * Сразу запускаем адресную передачу индивидуальных FEED_PLAN
-         * всем найденным ведомым устройствам.
+         * На этом этапе feed_plan_store() уже скопировал все параметры
+         * из временных массивов в feed_plan_data структуры protocol.c.
+         *
+         * Поэтому временные массивы можно очистить до запуска таймера.
+         */
+        feed_plan_input_reset();
+
+        /*
+         * Сообщение USB CDC отправляется до запуска пакета.
+         *
+         * После feed_plan_send_all_async() может быть запущен первый
+         * сегмент ROM_MATCH, поэтому выполнять USB-операции уже нельзя.
+         */
+        comport_send_response("FEED PLAN saved; sending to devices\r\n");
+
+        /*
+         * Эта функция запускает первый пакет:
+         *
+         * ROM_MATCH -> адрес -> размер -> FEED_PLAN -> данные.
+         *
+         * При успешном запуске она может сразу включить TIM2.
+         * Поэтому после неё в данной ветке ничего выполнять не нужно.
          */
         if (!feed_plan_send_all_async())
         {
             feed_plan_reset();
-            feed_plan_input_fail();
+
+            /*
+             * Если запуск не состоялся, таймер не работает,
+             * поэтому сообщение об ошибке отправлять безопасно.
+             */
+            comport_send_response("FEED PLAN start error\r\n");
             return;
         }
 
-        feed_plan_input_reset();
-
-        comport_send_response("FEED PLAN saved\r\n");
+        return;
 }
 // ========== Разбор десятичного uint32_t ==========
 // Для плана питания числа вводятся как обычные десятичные значения.
@@ -1339,18 +1374,28 @@ static void feed_plan_process_input_line(char **argv, int argc)
             }
 
             /*
-             * План успешно сохранён в памяти мастера.
-             * Сразу запускаем передачу индивидуальных масок ведомым устройствам.
+             * План уже скопирован в feed_plan_data.
+             * Очищаем временные данные до запуска первого сегмента.
+             */
+            feed_plan_input_reset();
+
+            /*
+             * USB-сообщение должно быть передано до запуска TIM2.
+             */
+            comport_send_response("FEED PLAN saved; sending to devices\r\n");
+
+            /*
+             * После успешного запуска пакета FEED_PLAN код ниже
+             * не должен обращаться к USB CDC или выполнять разбор строк.
              */
             if (!feed_plan_send_all_async())
             {
                 feed_plan_reset();
-                feed_plan_input_fail();
+
+                comport_send_response("FEED PLAN start error\r\n");
                 return;
             }
 
-            feed_plan_input_reset();
-            comport_send_response("FEED PLAN saved\r\n");
             return;
         }
 
