@@ -34,7 +34,7 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
  ../Middlewares/ST/STM32_USB_Device_Library/Core/Inc/usbd_def.h \
  ../USB_DEVICE/Target/usbd_conf.h ../Core/Inc/protocol.h \
  ../Core/Inc/comport.h ../Core/Inc/protocol.h ../Core/Inc/ppe3323.h \
- ../Core/Inc/main.h
+ ../Core/Inc/main.h ../Core/Inc/power_control.h
 ../Core/Inc/main.h:
 ../Drivers/STM32F4xx_HAL_Driver/Inc/stm32f4xx_hal.h:
 ../Core/Inc/stm32f4xx_hal_conf.h:
@@ -75,3 +75,4 @@ Core/Src/main.o: ../Core/Src/main.c ../Core/Inc/main.h \
 ../Core/Inc/protocol.h:
 ../Core/Inc/ppe3323.h:
 ../Core/Inc/main.h:
+../Core/Inc/power_control.h:

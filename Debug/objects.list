@@ -1,5 +1,6 @@
 "./Core/Src/comport.o"
 "./Core/Src/main.o"
+"./Core/Src/power_control.o"
 "./Core/Src/ppe3323.o"
 "./Core/Src/protocol.o"
 "./Core/Src/stm32f4xx_hal_msp.o"

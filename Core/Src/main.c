@@ -26,6 +26,7 @@
 #include "protocol.h"
 #include "comport.h"
 #include "ppe3323.h"
+#include "power_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -90,6 +91,21 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 // ========== Обработка подготовленной команды PPE-3323 ==========
 static void process_ppe_command(void)
 {
+	/*
+	     * Во время автоматического цикла питания оператор не должен
+	     * менять напряжение, ток или состояние OUT1 вручную.
+	     *
+	     * PPE STATUS остаётся разрешённой командой.
+	     */
+	    if (power_control_is_automatic_mode() &&
+	        (ppe_command_type != PPE_COMMAND_STATUS))
+	    {
+	        comport_send_response(
+	            "PPE: manual control is blocked during automatic power mode\r\n");
+
+	        comport_clear_ppe_command();
+	        return;
+	    }
     bool accepted = false;
 
     switch (ppe_command_type)
@@ -196,8 +212,13 @@ int main(void)
    */
   ppe3323_init(&huart1);
 
-  (void)ppe3323_queue_output_off();
-  ppe3323_poll();
+  /*
+   * Инициализация автомата источника.
+   *
+   * Он самостоятельно поставит OUT0 в очередь, чтобы после запуска
+   * ведущего выход PPE-3323 оставался выключенным.
+   */
+  power_control_init();
 
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, 1);
   //search_rom_packet_blocking();
@@ -213,13 +234,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-      /*
-       * Запуск и сопровождение неблокирующей передачи команд PPE-3323.
-       *
-       * Функция должна вызываться даже при занятом протоколе.
-       * Она не выполняет ожидание и не использует HAL_Delay().
-       */
-      ppe3323_poll();
+	  /*
+	   * Фоновая работа с PPE-3323.
+	   *
+	   * Функция вызывается даже во время работы протокола,
+	   * но сама не блокирует выполнение программы.
+	   */
+	  power_control_poll();
 	    // 1. Если протокол только что завершился – вывести результат
 	    if (protocol_was_busy && !protocol_is_busy())
 	    {
@@ -273,7 +294,15 @@ int main(void)
 	    {
 	        continue;
 	    }
-
+        /*
+         * Ошибка выводится только когда протокол свободен,
+         * чтобы USB CDC не влиял на временные интервалы сегментов.
+         */
+        if (power_control_take_fault_report())
+        {
+            comport_send_response(
+                "POWER: source is not ready; PB1 remains OFF\r\n");
+        }
 	    // 2.1. Если внутренняя обработка прерывания или alarm завершилась,
 	    // выводим результат пользователю через COM-порт.
 	    //

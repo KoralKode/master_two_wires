@@ -1,6 +1,7 @@
 #include "protocol.h"
 #include <string.h>
 #include "main.h"
+#include "power_control.h"
 // ===== Формат передаваемых данных FEED_PLAN =====
 // Максимум фаз – 32, поэтому маска занимает максимум 4 байта.
 //
@@ -477,31 +478,35 @@ static uint32_t power_phase_us_to_timer_ticks(uint32_t duration_us)
     return ticks;
 }
 
-/*
- * Запуск активной части реальной фазы питания.
- *
- * До вызова этой функции уже должно пройти
- * phase_extra_duration_us – время перестройки источника.
- *
- * На данном этапе PB1 становится равным единице только как
- * управляющий и тестовый сигнал. В дальнейшем он включит
- * внешний ключ между PPE-3323 и линией данных.
- */
 static void start_real_power_active_part(void)
 {
     /*
-     * Перед включением ключа линия уже отпущена в start_power_phase()
-     * через DATA_HIGH(). Поэтому STM32 не удерживает её в нуле.
+     * PB0 уже отпущен в start_power_phase().
+     *
+     * PB1 разрешается включать только когда:
+     * - параметры VSET1/ISET1 переданы;
+     * - OUT1 передан;
+     * - UART не сообщил об ошибке.
      */
-    power_key_on();
+    if (power_control_is_phase_ready())
+    {
+        power_key_on();
+    }
+    else
+    {
+        /*
+         * Источник не успел подготовиться за T_EXTRA.
+         *
+         * PB1 остаётся выключенным. Линия не подключается к источнику.
+         * Продолжительность активного интервала сохраняется, чтобы
+         * ведомые не получили фазу меньшей длительности.
+         */
+        power_key_off();
+        power_control_mark_phase_not_ready();
+    }
 
     power_phase_stage = POWER_PHASE_STAGE_REAL_ACTIVE;
 
-    /*
-     * После дополнительного времени начинается активное питание.
-     * Длительность phase_duration_us проверяется при приёме плана
-     * и должна быть больше нуля.
-     */
     phase_ticks =
             power_phase_us_to_timer_ticks(
                     feed_plan_data.phase_duration_us);
@@ -542,6 +547,7 @@ static void start_power_phase(state_t next_state)
      * ключ должен оставаться выключенным.
      */
     if ((real_power_phase_enabled != 0U) &&
+        power_control_is_automatic_mode() &&
         (feed_plan_data.valid != 0U) &&
         (feed_plan_data.phase_count != 0U) &&
         (feed_plan_data.phase_count <= FEED_PLAN_MAX_PHASES) &&
@@ -559,7 +565,15 @@ static void start_power_phase(state_t next_state)
 
         active_real_power_phase = 1U;
         active_real_power_phase_index = real_power_phase_index;
-
+        /*
+         * Сохраняем запрос настройки текущей фазы.
+         *
+         * UART-команды не передаются из TIM2 IRQ.
+         * Их обработает power_control_poll() в main().
+         */
+        power_control_request_phase(
+                feed_plan_data.phase_voltage[active_real_power_phase_index],
+                feed_plan_data.phase_current[active_real_power_phase_index]);
         /*
          * Если дополнительное время равно нулю, активную часть
          * можно начать сразу.
@@ -811,7 +825,12 @@ static void handle_service_flags_after_segment(void)
          * После подключения оборудования это сразу отсоединит
          * PPE-3323 от линии данных.
          */
-        power_key_off();
+    	/*
+    	 * PB1 отключается сразу.
+    	 * OUT0 будет поставлен в очередь из main().
+    	 */
+    	power_key_off();
+    	power_control_disable();
 
         alarm_pending = 1U;
 
@@ -1884,7 +1903,13 @@ void feed_plan_reset(void)
     // При сбросе плана ключ всегда переводится в безопасное состояние.
     power_phase_stage = POWER_PHASE_STAGE_NONE;
     power_key_off();
-
+    /*
+     * После сброса плана реальный источник должен быть выключен.
+     *
+     * Функция не вызывает UART напрямую, поэтому безопасна даже
+     * при вызове из логики поиска устройств.
+     */
+    power_control_disable();
     // Если в момент сброса шла передача плана ведомым,
     // внутреннее состояние передачи также сбрасывается.
     feed_plan_send_reset_state();
@@ -1920,7 +1945,15 @@ bool feed_plan_store(uint8_t phase_count,
     {
         return false;
     }
-
+    /*
+     * Для автоматического управления PPE-3323 дополнительное время
+     * обязательно: в этот интервал передаются VSET1, ISET1 и при первом
+     * запуске OUT1, а затем источник успевает установить напряжение.
+     */
+    if (phase_extra_duration_us == 0U)
+    {
+        return false;
+    }
     // Проверяем, что полная длительность фазы
     // phase_duration_us + phase_extra_duration_us
     // помещается в uint32_t.
@@ -2121,6 +2154,14 @@ static bool feed_plan_start_next_slave(void)
     // FEED_PLAN можно разрешить переход к реальной фазе питания.
     feed_plan_sent_ok = 1U;
     update_real_power_phase_enabled();
+    /*
+     * Все ведомые получили индивидуальные маски.
+     *
+     * Теперь при начале реальной фазы можно автоматически
+     * отправлять VSET1, ISET1 и OUT1 источнику PPE-3323.
+     */
+    power_control_arm_new_plan();
+
     protocol_event_type = PROTOCOL_EVENT_FEED_PLAN_SENT;
 
     return true;
@@ -2171,6 +2212,7 @@ static void feed_plan_continue_sending(void)
 
         power_phase_stage = POWER_PHASE_STAGE_NONE;
         power_key_off();
+        power_control_disable();
     }
 }
 
@@ -2226,7 +2268,11 @@ bool feed_plan_send_all_async(void)
      */
     power_phase_stage = POWER_PHASE_STAGE_NONE;
     power_key_off();
-
+    /*
+     * Старый план не должен оставлять OUT1 включённым,
+     * пока ведомым передаётся новый FEED_PLAN.
+     */
+    power_control_disable();
     feed_plan_send_processing = 1U;
     feed_plan_send_waiting_packet = 0U;
     feed_plan_send_index = 0U;

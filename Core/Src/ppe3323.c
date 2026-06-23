@@ -69,6 +69,14 @@ static volatile ppe3323_command_t ppe3323_active_command =
  */
 static volatile uint8_t ppe3323_phase_configuration_valid = 0U;
 
+/*
+ * Признак того, что OUT1 был успешно передан по UART.
+ *
+ * Он используется автоматом питания, чтобы не повторять OUT1
+ * перед каждой фазой.
+ */
+static volatile uint8_t ppe3323_output_on = 0U;
+
 static volatile ppe3323_state_t ppe3323_state =
         PPE3323_STATE_NOT_INITIALIZED;
 
@@ -130,6 +138,8 @@ void ppe3323_init(UART_HandleTypeDef *uart)
     ppe3323_active_command = PPE3323_COMMAND_NONE;
 
     ppe3323_phase_configuration_valid = 0U;
+
+    ppe3323_output_on = 0U;
 
     if (ppe3323_uart == NULL)
     {
@@ -195,7 +205,14 @@ void ppe3323_poll(void)
 
         ppe3323_phase_configuration_valid = 0U;
 
+        /*
+         * После ошибки неизвестно, в каком состоянии находится OUT1.
+         * Поэтому дальше считаем его выключенным.
+         */
+        ppe3323_output_on = 0U;
+
         ppe3323_state = PPE3323_STATE_ERROR;
+
     }
 }
 
@@ -318,6 +335,16 @@ bool ppe3323_has_phase_configuration(void)
     return (ppe3323_phase_configuration_valid != 0U);
 }
 
+bool ppe3323_output_is_on(void)
+{
+    return (ppe3323_output_on != 0U);
+}
+
+
+bool ppe3323_has_error(void)
+{
+    return (ppe3323_state == PPE3323_STATE_ERROR);
+}
 
 void ppe3323_uart_tx_complete_callback(UART_HandleTypeDef *uart)
 {
@@ -326,23 +353,36 @@ void ppe3323_uart_tx_complete_callback(UART_HandleTypeDef *uart)
         return;
     }
 
-    /*
-     * Здесь подтверждается только завершение передачи байтов
-     * из STM32 в MAX3232.
-     *
-     * Внутреннее выполнение команды и физическая перестройка
-     * PPE-3323 выполняются позже и будут учтены
-     * дополнительным временем фазы питания.
-     */
     if (ppe3323_active_command == PPE3323_COMMAND_SET_PHASE)
     {
+        /*
+         * VSET1 и ISET1 переданы по UART.
+         *
+         * Физическое установление напряжения выполняется
+         * во время T_EXTRA.
+         */
         ppe3323_phase_configuration_valid = 1U;
+    }
+    else if (ppe3323_active_command == PPE3323_COMMAND_OUTPUT_ON)
+    {
+        /*
+         * OUT1 передан источнику.
+         */
+        ppe3323_output_on = 1U;
+    }
+    else if (ppe3323_active_command == PPE3323_COMMAND_OUTPUT_OFF)
+    {
+        /*
+         * OUT0 передан источнику.
+         */
+        ppe3323_output_on = 0U;
     }
 
     ppe3323_active_command = PPE3323_COMMAND_NONE;
     ppe3323_tx_active = 0U;
 
     ppe3323_state = PPE3323_STATE_IDLE;
+
 }
 
 
@@ -365,6 +405,11 @@ void ppe3323_uart_error_callback(UART_HandleTypeDef *uart)
     ppe3323_active_command = PPE3323_COMMAND_NONE;
 
     ppe3323_phase_configuration_valid = 0U;
+
+    /*
+     * При ошибке UART состояние OUT1 больше нельзя считать известным.
+     */
+    ppe3323_output_on = 0U;
 
     ppe3323_state = PPE3323_STATE_ERROR;
 }

@@ -101,6 +101,19 @@ const char *ppe3323_state_text(void);
  */
 bool ppe3323_has_phase_configuration(void);
 
+/*
+ * Возвращает 1, если команда OUT1 успешно передана по UART.
+ *
+ * Это программный признак драйвера. Он не измеряет реальное
+ * напряжение на выходе источника.
+ */
+bool ppe3323_output_is_on(void);
+
+
+/*
+ * Возвращает 1 при ошибке UART или ошибке запуска передачи.
+ */
+bool ppe3323_has_error(void);
 
 /*
  * Эти функции вызываются из HAL callback-функций main.c.
