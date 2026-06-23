@@ -31,7 +31,7 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-#define RX_LINE_BUFFER_SIZE 256          // размер буфера накопления
+#define RX_LINE_BUFFER_SIZE 1024          // размер буфера накопления
 #define RX_QUEUE_SIZE       5            // глубина очереди команд
 
 static uint8_t rx_line_buffer[RX_LINE_BUFFER_SIZE];

@@ -191,6 +191,16 @@ static void feed_plan_input_fail(void);
 // Разбор одной строки плана питания.
 static void feed_plan_process_input_line(char **argv, int argc);
 
+/*
+ * Разбор плана питания, введённого одной строкой.
+ *
+ * Формат:
+ * PLAN N U1 ... UN I1 ... IN T_ACTIVE_US T_EXTRA_US
+ *      MASK_ROM0 ... MASK_ROM[n]
+ */
+static void feed_plan_process_single_line(char **argv, int argc);
+
+
 // Разбор десятичного uint32_t.
 static bool parse_uint32_dec_token(const char *token, uint32_t *value);
 
@@ -258,7 +268,7 @@ void comport_send_response(const char *fmt, ...)
 // Проверить очередь USB CDC и обработать все введённые строки
 void comport_poll(void)
 {
-    char line[COMPORT_LINE_MAX];
+    static char line[COMPORT_LINE_MAX];
 
     // USBD_CDC_GetLine() возвращает готовую строку из очереди USB CDC.
     // Если пользователь ввёл несколько строк подряд, обрабатываем все.
@@ -387,13 +397,22 @@ void comport_process_line(char *line)
     // затем по одной битовой маске на каждое найденное ведомое устройство.
     if (str_eq_ci(argv[0], "PLAN") || str_eq_ci(argv[0], "FEEDPLAN"))
     {
-        if (argc != 1)
+        /*
+         * Основной формат: план передаётся одной строкой.
+         *
+         * PLAN N U1 ... UN I1 ... IN T_ACTIVE_US T_EXTRA_US
+         *      MASK_ROM0 ... MASK_ROM[n]
+         *
+         * Если передано только слово PLAN, старый построчный формат
+         * остаётся доступным как резервный вариант.
+         */
+        if (argc == 1)
         {
-            comport_send_response("wrong data\r\n");
+            feed_plan_input_start();
             return;
         }
 
-        feed_plan_input_start();
+        feed_plan_process_single_line(argv, argc);
         return;
     }
     /*
@@ -809,7 +828,204 @@ static void feed_plan_input_fail(void)
     comport_send_response("wrong data\r\n");
 }
 
+// ========== Разбор плана питания, введённого одной строкой ==========
+static void feed_plan_process_single_line(char **argv, int argc)
+{
+    uint32_t phase_count_value = 0U;
+    uint32_t expected_argc = 0U;
 
+    int voltage_index;
+    int current_index;
+    int active_duration_index;
+    int extra_duration_index;
+    int masks_index;
+
+    /*
+     * План невозможно связать с масками, если поиск устройств
+     * ещё не выполнялся или не обнаружил ни одного ведомого.
+     */
+    if ((argv == NULL) || (argc < 2) || (found_rom_count == 0U))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * argv[0] содержит PLAN.
+     * argv[1] содержит количество фаз.
+     */
+    if (!parse_uint32_dec_token(argv[1], &phase_count_value))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    if ((phase_count_value == 0U) ||
+        (phase_count_value > FEED_PLAN_MAX_PHASES))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Общее число токенов:
+     *
+     * PLAN
+     * + N
+     * + N напряжений
+     * + N токов
+     * + T_ACTIVE
+     * + T_EXTRA
+     * + found_rom_count масок.
+     */
+    expected_argc = 4U +
+                    (2U * phase_count_value) +
+                    (uint32_t)found_rom_count;
+
+    if ((uint32_t)argc != expected_argc)
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Очищаем временные массивы и используем их для разбора
+     * однострочной команды так же, как в старом построчном режиме.
+     */
+    feed_plan_input_reset();
+
+    feed_plan_input_phase_count = (uint8_t)phase_count_value;
+
+    voltage_index = 2;
+    current_index = voltage_index + (int)feed_plan_input_phase_count;
+
+    active_duration_index =
+            current_index + (int)feed_plan_input_phase_count;
+
+    extra_duration_index = active_duration_index + 1;
+    masks_index = extra_duration_index + 1;
+
+    /*
+     * Разбор напряжений фаз.
+     */
+    if (!parse_feed_plan_voltage_line(
+            &argv[voltage_index],
+            feed_plan_input_phase_count,
+            feed_plan_input_phase_count,
+            feed_plan_input_voltage))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Разбор токов фаз.
+     */
+    if (!parse_feed_plan_current_line(
+            &argv[current_index],
+            feed_plan_input_phase_count,
+            feed_plan_input_phase_count,
+            feed_plan_input_current))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Разбор активной части фазы.
+     */
+    if (!parse_uint32_dec_token(
+            argv[active_duration_index],
+            &feed_plan_input_duration_us))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    if (feed_plan_input_duration_us == 0U)
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Разбор дополнительного времени на передачу команд источнику
+     * и установление нового напряжения.
+     */
+    if (!parse_uint32_dec_token(
+            argv[extra_duration_index],
+            &feed_plan_input_extra_duration_us))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * В разработанной программе дополнительное время не может быть
+     * нулевым, так как в нём передаются VSET1, ISET1 и OUT1.
+     */
+    if (feed_plan_input_extra_duration_us == 0U)
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Проверяем, что полная длительность фазы помещается в uint32_t.
+     */
+    if (feed_plan_input_extra_duration_us >
+        (0xFFFFFFFFUL - feed_plan_input_duration_us))
+    {
+        feed_plan_input_fail();
+        return;
+    }
+
+    /*
+     * Каждая маска должна содержать ровно N символов 0 или 1.
+     * Количество масок должно совпадать с количеством найденных ROM.
+     */
+    for (uint8_t i = 0U; i < found_rom_count; i++)
+    {
+        if (!parse_feed_plan_mask_line(
+                argv[masks_index + (int)i],
+                feed_plan_input_phase_count,
+                &feed_plan_input_masks[i]))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+    }
+
+    /*
+         * Сохраняем план в protocol.c.
+         */
+        if (!feed_plan_store(feed_plan_input_phase_count,
+                             feed_plan_input_voltage,
+                             feed_plan_input_current,
+                             feed_plan_input_duration_us,
+                             feed_plan_input_extra_duration_us,
+                             feed_plan_input_masks,
+                             found_rom_count))
+        {
+            feed_plan_input_fail();
+            return;
+        }
+
+        /*
+         * Сразу запускаем адресную передачу индивидуальных FEED_PLAN
+         * всем найденным ведомым устройствам.
+         */
+        if (!feed_plan_send_all_async())
+        {
+            feed_plan_reset();
+            feed_plan_input_fail();
+            return;
+        }
+
+        feed_plan_input_reset();
+
+        comport_send_response("FEED PLAN saved\r\n");
+}
 // ========== Разбор десятичного uint32_t ==========
 // Для плана питания числа вводятся как обычные десятичные значения.
 static bool parse_uint32_dec_token(const char *token, uint32_t *value)
@@ -1651,16 +1867,19 @@ static void print_help(void)
     comport_send_response("  PACK RX MATCH 10 A1 10 12 34 PARAMETERS\r\n");
     comport_send_response("  PACK SEARCH\r\n");
 
-    comport_send_response("\r\nFeed plan input:\r\n");
-    comport_send_response("  PLAN\r\n");
-    comport_send_response("  N\r\n");
-    comport_send_response("  U1 U2 ... UN\r\n");
-    comport_send_response("  I1 I2 ... IN\r\n");
-    comport_send_response("  T_ACTIVE_US\r\n");
-    comport_send_response("  T_EXTRA_US\r\n");
-    comport_send_response("  MASK for ROM[0]\r\n");
-    comport_send_response("  MASK for ROM[1]\r\n");
-    comport_send_response("  ...\r\n");
+    comport_send_response("\r\nFeed plan, one-line format:\r\n");
+    comport_send_response(
+        "  PLAN N U1 ... UN I1 ... IN T_ACTIVE_US T_EXTRA_US "
+        "MASK_ROM0 ... MASK_ROMn\r\n");
+
+    comport_send_response(
+        "  Example for one device and two phases:\r\n");
+
+    comport_send_response(
+        "  PLAN 2 5 8 10 100 50000 250000 10\r\n");
+
+    comport_send_response(
+        "  Number of masks must equal Found ROM count.\r\n");
     comport_send_response("  U values: volts, 0...32\r\n");
     comport_send_response("  I values: milliamperes, 0...3000\r\n");
 

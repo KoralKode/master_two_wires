@@ -13,7 +13,7 @@
 #include <stdbool.h>
 
 // Максимальная длина одной строки команды из COM-порта
-#define COMPORT_LINE_MAX     256U
+#define COMPORT_LINE_MAX     1024U
 
 // Максимальное количество токенов в одной строке
 #define COMPORT_MAX_TOKENS   96U
