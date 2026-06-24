@@ -320,6 +320,7 @@ static void advance_real_power_phase(void);
 static void power_key_on(void);
 static void power_key_off(void);
 static void start_real_power_active_part(void);
+static bool power_phase_execution_allowed(void);
 
 static bool rom_cmd_has_address(uint8_t rom_cmd);
 
@@ -478,15 +479,48 @@ static uint32_t power_phase_us_to_timer_ticks(uint32_t duration_us)
     return ticks;
 }
 
+// ========== Проверка возможности выполнения выполнения реальной фазы ==========
+static bool power_phase_execution_allowed(void)
+{
+#if (POWER_PHASE_TEST_WITHOUT_SOURCE != 0U)
+
+    /*
+     * В режиме проверки без источника реальная временная диаграмма
+     * должна выполняться независимо от состояния PPE-3323.
+     */
+    return true;
+
+#else
+
+    /*
+     * В штатном режиме фазу разрешает автомат управления источником.
+     */
+    return power_control_is_automatic_mode();
+
+#endif
+}
+
 static void start_real_power_active_part(void)
 {
+#if (POWER_PHASE_TEST_WITHOUT_SOURCE != 0U)
+
     /*
-     * PB0 уже отпущен в start_power_phase().
+     * Проверочный режим без PPE-3323.
      *
-     * PB1 разрешается включать только когда:
-     * - параметры VSET1/ISET1 переданы;
-     * - OUT1 передан;
-     * - UART не сообщил об ошибке.
+     * После окончания T_EXTRA формируется импульс PB1 независимо
+     * от состояния UART и источника питания.
+     *
+     * Источник в этот момент должен быть физически отключён от линии.
+     */
+    power_key_on();
+
+#else
+
+    /*
+     * Штатный режим с PPE-3323.
+     *
+     * PB1 разрешается включать только когда параметры VSET1/ISET1
+     * переданы, OUT1 включён и автомат источника не сообщил ошибку.
      */
     if (power_control_is_phase_ready())
     {
@@ -496,15 +530,17 @@ static void start_real_power_active_part(void)
     {
         /*
          * Источник не успел подготовиться за T_EXTRA.
-         *
-         * PB1 остаётся выключенным. Линия не подключается к источнику.
-         * Продолжительность активного интервала сохраняется, чтобы
-         * ведомые не получили фазу меньшей длительности.
+         * Ключ остаётся выключенным.
          */
         power_key_off();
         power_control_mark_phase_not_ready();
     }
 
+#endif
+
+    /*
+     * После T_EXTRA начинается активная часть фазы.
+     */
     power_phase_stage = POWER_PHASE_STAGE_REAL_ACTIVE;
 
     phase_ticks =
@@ -547,7 +583,7 @@ static void start_power_phase(state_t next_state)
      * ключ должен оставаться выключенным.
      */
     if ((real_power_phase_enabled != 0U) &&
-        power_control_is_automatic_mode() &&
+        power_phase_execution_allowed() &&
         (feed_plan_data.valid != 0U) &&
         (feed_plan_data.phase_count != 0U) &&
         (feed_plan_data.phase_count <= FEED_PLAN_MAX_PHASES) &&
@@ -571,9 +607,25 @@ static void start_power_phase(state_t next_state)
          * UART-команды не передаются из TIM2 IRQ.
          * Их обработает power_control_poll() в main().
          */
+#if (POWER_PHASE_TEST_WITHOUT_SOURCE == 0U)
+
+        /*
+         * В штатном режиме перед началом T_EXTRA передаются
+         * параметры очередной фазы источнику PPE-3323.
+         */
         power_control_request_phase(
                 feed_plan_data.phase_voltage[active_real_power_phase_index],
                 feed_plan_data.phase_current[active_real_power_phase_index]);
+
+#else
+
+        /*
+         * В проверочном режиме источник отключён.
+         * Напряжение и ток не передаются по UART, но T_EXTRA
+         * и T_ACTIVE всё равно отрабатываются по таймеру.
+         */
+
+#endif
         /*
          * Если дополнительное время равно нулю, активную часть
          * можно начать сразу.
@@ -2638,6 +2690,54 @@ static void continue_alarm_processing(void)
     alarm_step = ALARM_STEP_NONE;
 }
 
+// ========== Запуск очередной фазы питания в свободном состоянии ==========
+bool protocol_start_idle_power_cycle(void)
+{
+    /*
+     * Нельзя запускать фазу, пока выполняется пакет, поиск,
+     * приём PARAMETERS либо передача FEED_PLAN.
+     */
+    if (global_state != IDLE)
+    {
+        return false;
+    }
+
+    /*
+     * Реальный цикл запускается только после успешной передачи
+     * индивидуальных планов всем ведомым устройствам.
+     */
+    if ((real_power_phase_enabled == 0U) ||
+        (feed_plan_sent_ok == 0U) ||
+        (feed_plan_data.valid == 0U) ||
+        (feed_plan_data.phase_count == 0U))
+    {
+        return false;
+    }
+
+    /*
+     * Приоритет имеют тревога, прерывание, поиск и внутренние
+     * процедуры получения параметров ведомых устройств.
+     */
+    if (alarm_pending ||
+        alarm_processing ||
+        interrupt_pending ||
+        interrupt_processing ||
+        feed_plan_send_processing ||
+        power_params_processing ||
+        (protocol_event_type != PROTOCOL_EVENT_NONE))
+    {
+        return false;
+    }
+
+    /*
+     * Фаза завершается переходом в SEQ_END.
+     * Затем автомат возвращается в IDLE, а в main() будет
+     * запущена следующая фаза либо пользовательский пакет.
+     */
+    start_power_phase(SEQ_END);
+
+    return true;
+}
 
 // ========== Фоновая обработка внутренних событий протокола ==========
 // Эта функция вызывается из main.c в основном цикле.

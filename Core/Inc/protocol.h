@@ -33,6 +33,19 @@ extern TIM_HandleTypeDef htim2;
  */
 #define SIMULATED_POWER_PHASE_US  10000U
 
+/*
+ * Режим проверки временной диаграммы фаз питания без PPE-3323.
+ *
+ * 1 — PB1 включается по окончании T_EXTRA без ожидания готовности
+ *     источника. Используется только при отключённом источнике питания.
+ *
+ * 0 — штатный режим: PB1 включается только после настройки PPE-3323,
+ *     передачи OUT1 и подтверждения готовности автомата питания.
+ *
+ * Перед подключением PPE-3323 к линии обязательно установить 0.
+ */
+#define POWER_PHASE_TEST_WITHOUT_SOURCE  1U
+
 #define MAX_FOUND_DEVICES          16U
 #define SEARCH_GROUPS_PER_SEGMENT  5U
 #define SEARCH_TOTAL_BITS          (ROM_ID_LEN * 8U)
@@ -281,6 +294,15 @@ bool receive_pack_async(uint8_t func_cmd,
 bool receive_pack_skip_async(uint8_t func_cmd, uint8_t receive_size);
 
 void clear_received_data(void);
+
+/*
+ * Запускает очередную фазу питания, если протокол свободен,
+ * план успешно передан ведомым и нет более приоритетной задачи.
+ *
+ * Используется для непрерывного выполнения принятого плана питания
+ * между пакетами протокола.
+ */
+bool protocol_start_idle_power_cycle(void);
 
 void search_rom_packet_reset(void);
 bool search_rom_packet_async(void);
